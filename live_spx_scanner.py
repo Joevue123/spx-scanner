@@ -6,6 +6,7 @@ import math
 import os
 import smtplib
 import threading
+import time
 import traceback
 from datetime import datetime, date, timedelta, timezone
 from email.mime.text import MIMEText
@@ -48,6 +49,8 @@ PCR_BEAR_THRESH       = 1.2      # put/call ratio above this = puts dominating =
 OPTIONS_REFRESH_SECS  = 300      # re-fetch options every 5 min
 ECON_REFRESH_SECS     = 3600     # re-fetch economic calendar hourly
 ECON_CAL_URL          = "https://nfs.faireconomy.media/ff_calendar_thisweek.json"
+OUTCOMES_FILE         = "/tmp/outcomes.json"
+TRADE_MAX_MINS        = 240      # expire open simulated trades after 4 hours
 
 print("=== SPX CONFLUENCE SCANNER STARTING ===", flush=True)
 
@@ -263,6 +266,76 @@ def send_daily_summary():
     )
 
 
+# ====================== TRADE TRACKING (Phase 6) ======================
+
+def track_signal(ticker, price, stop, tp, direction, score):
+    """Open a simulated trade. One open trade per ticker+direction at a time."""
+    for t in open_trades.values():
+        if t["ticker"] == ticker and t["direction"] == direction:
+            return  # already tracking this setup
+    trade_id = f"{ticker}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    open_trades[trade_id] = {
+        "id":        trade_id,
+        "ticker":    ticker,
+        "direction": direction,
+        "entry":     round(float(price), 4),
+        "stop":      round(float(stop),  4),
+        "tp":        round(float(tp),    4),
+        "score":     score,
+        "open_time": datetime.now().isoformat(),
+        "open_ts":   time.time(),
+    }
+    print(f"[TRADE] OPEN {ticker} {direction} @ ${price:.2f} SL${stop:.2f} TP${tp:.2f} [{score}/{MAX_SCORE}]", flush=True)
+
+
+def check_outcomes():
+    """Check open trades against current prices; close wins/losses/timeouts."""
+    global outcomes
+    now_ts = time.time()
+    closed = []
+    for trade_id, t in list(open_trades.items()):
+        d     = dashboard_data.get(t["ticker"], {})
+        price = d.get("price")
+        if price is None:
+            continue
+        result = None
+        if t["direction"] == "BULL":
+            if price >= t["tp"]:   result = "WIN"
+            elif price <= t["stop"]: result = "LOSS"
+        else:
+            if price <= t["tp"]:   result = "WIN"
+            elif price >= t["stop"]: result = "LOSS"
+        elapsed_mins = (now_ts - t["open_ts"]) / 60
+        if result is None and elapsed_mins >= TRADE_MAX_MINS:
+            result = "TIMEOUT"
+        if result:
+            risk = abs(t["entry"] - t["stop"])
+            if result == "WIN":
+                r_mult = round(abs(t["tp"] - t["entry"]) / risk, 2) if risk > 0 else None
+            elif result == "LOSS":
+                r_mult = -1.0
+            else:
+                pnl = (price - t["entry"]) if t["direction"] == "BULL" else (t["entry"] - price)
+                r_mult = round(pnl / risk, 2) if risk > 0 else None
+            outcome = {
+                **t,
+                "result":       result,
+                "exit_price":   round(float(price), 4),
+                "close_time":   datetime.now().isoformat(),
+                "r_multiple":   r_mult,
+                "elapsed_mins": round(elapsed_mins, 1),
+            }
+            outcomes.append(outcome)
+            outcomes = outcomes[-500:]
+            closed.append(trade_id)
+            icon = "✅" if result == "WIN" else "❌" if result == "LOSS" else "⏱"
+            print(f"[TRADE] {icon} CLOSE {t['ticker']} {t['direction']} {result} @ ${price:.2f} R={r_mult}", flush=True)
+    for tid in closed:
+        del open_trades[tid]
+    if closed:
+        _save_outcomes()
+
+
 # ====================== INDICATORS ======================
 
 def _calc_ha_bull(df):
@@ -402,6 +475,8 @@ def send_notifications(ticker, price, bull_score, bear_score, direction,
     )
 
     _last_alert_times[ticker] = now
+    if stop and tp:
+        track_signal(ticker, price, stop, tp, direction, score)
 
     dashboard_data[ticker]["alerts"].insert(0, {
         "time":      now.strftime("%H:%M:%S"),
@@ -457,6 +532,28 @@ econ_fetched = None   # datetime of last fetch
 
 # Options flow per ticker (populated by yfinance, no Polygon rate limit)
 options_data = {}     # {ticker: {pcr, pcr_oi, call_vol, put_vol, expiry, last_update}}
+
+# Simulated trade tracking (Phase 6)
+open_trades = {}   # {trade_id: trade_dict} — currently open simulated positions
+outcomes    = []   # list of closed trade outcome dicts, capped at 500
+
+def _load_outcomes():
+    global outcomes
+    try:
+        if os.path.isfile(OUTCOMES_FILE):
+            with open(OUTCOMES_FILE) as f:
+                outcomes = json.load(f)
+    except Exception:
+        pass
+
+def _save_outcomes():
+    try:
+        with open(OUTCOMES_FILE, "w") as f:
+            json.dump(outcomes[-500:], f)
+    except Exception:
+        pass
+
+_load_outcomes()
 
 # Market breadth — computed from dashboard_data after each full scan cycle
 # Used as a free VIX proxy (no extra API call): bull_dominant ≈ VIX falling
@@ -538,6 +635,14 @@ def pwa_manifest():
         "theme_color": "#00ffcc",
         "start_url": "/",
         "icons": [],
+    })
+
+
+@app.route('/api/outcomes')
+def api_outcomes():
+    return jsonify({
+        "open_trades": list(open_trades.values()),
+        "outcomes":    outcomes[-200:],
     })
 
 
@@ -1191,6 +1296,10 @@ async def main():
             # Compute breadth from this cycle's results (no extra API call)
             update_market_breadth()
 
+            # Check open simulated trades for TP/SL hits (no extra API calls)
+            if market_open:
+                check_outcomes()
+
             # Daily summary: send once after 16:05 ET on trading days
             et_now = datetime.now(timezone.utc).astimezone(
                 __import__('zoneinfo', fromlist=['ZoneInfo']).ZoneInfo('America/New_York')
@@ -1413,6 +1522,7 @@ let signalLog    = [];
 let vixData      = null;
 let econEvents   = [];
 let optionsData  = {};
+let tradesData   = {open_trades: [], outcomes: []};
 let curTicker    = 'SPY';
 let curDir       = 'bull';
 let soundOn      = true;
@@ -1773,8 +1883,110 @@ function renderEconCalendar() {
 function renderAnalytics() {
   const panel = document.getElementById('analytics-panel');
   if (!panel) return;
+
+  function miniBar(pct, color) {
+    return `<div style="flex:1;background:#1a1a1a;border-radius:3px;height:10px;min-width:40px">
+      <div style="width:${Math.round(Math.min(pct,100))}%;background:${color};height:10px;border-radius:3px;transition:width .3s"></div>
+    </div>`;
+  }
+
+  // ── Trade Outcomes section ──────────────────────────────────────────────────
+  const ots    = tradesData.outcomes || [];
+  const opens  = tradesData.open_trades || [];
+  const wins   = ots.filter(o => o.result === 'WIN');
+  const losses = ots.filter(o => o.result === 'LOSS');
+  const tos    = ots.filter(o => o.result === 'TIMEOUT');
+  const rVals  = ots.map(o => o.r_multiple).filter(r => r != null);
+  const avgR   = rVals.length ? (rVals.reduce((a,b)=>a+b,0)/rVals.length).toFixed(2) : null;
+  const grossW = wins.reduce((s,o)=>s+(o.r_multiple||0),0);
+  const grossL = Math.abs(losses.reduce((s,o)=>s+(o.r_multiple||0),0));
+  const pf     = grossL > 0 ? (grossW/grossL).toFixed(2) : (grossW > 0 ? '∞' : '--');
+  const totalR = rVals.reduce((a,b)=>a+b,0).toFixed(2);
+
+  // Equity sparkline: cumulative R over closed trades
+  let cumR = 0;
+  const cumRseries = ots.map(o => { cumR += (o.r_multiple || 0); return cumR; });
+  const eqMax = Math.max(...cumRseries, 0.01);
+  const eqMin = Math.min(...cumRseries, 0);
+  const eqRange = eqMax - eqMin || 1;
+  const sparkH = 32;
+  const sparkW = Math.max(cumRseries.length * 6, 60);
+  let sparkPath = '';
+  cumRseries.forEach((v, i) => {
+    const x = Math.round(i / Math.max(cumRseries.length-1,1) * sparkW);
+    const y = Math.round(sparkH - (v - eqMin) / eqRange * sparkH);
+    sparkPath += (i===0 ? `M${x},${y}` : ` L${x},${y}`);
+  });
+  const sparkColor = cumR >= 0 ? '#00ff88' : '#ff6666';
+  const sparkSvg = cumRseries.length > 1
+    ? `<svg width="${sparkW}" height="${sparkH}" style="vertical-align:middle;margin-left:6px">
+        <path d="${sparkPath}" fill="none" stroke="${sparkColor}" stroke-width="1.5"/>
+       </svg>` : '';
+
+  const tradesHtml = `
+<div style="border-bottom:1px solid #1a1a1a;padding-bottom:10px;margin-bottom:10px">
+  <div class="section-title d-flex align-items-center gap-2">
+    Trade Outcomes (Simulated — ATR SL/TP)
+    ${sparkSvg}
+  </div>
+  ${ots.length === 0 ? `<span style="color:#555;font-size:.78rem">No closed trades yet. Trades open when score ≥ ${ALERT_SCORE_THRESH} during market hours.</span>` : `
+  <div class="d-flex flex-wrap gap-2 mb-2" style="font-size:.78rem">
+    <span class="ctx-badge ctx-neutral">Closed: ${ots.length}</span>
+    <span class="ctx-badge ctx-bull">✅ ${wins.length} (${ots.length?Math.round(wins.length/ots.length*100):0}%)</span>
+    <span class="ctx-badge ctx-bear">❌ ${losses.length} (${ots.length?Math.round(losses.length/ots.length*100):0}%)</span>
+    ${tos.length ? `<span class="ctx-badge ctx-neutral">⏱ ${tos.length}</span>` : ''}
+    ${avgR != null ? `<span class="ctx-badge ${parseFloat(avgR)>=0?'ctx-bull':'ctx-bear'}">Avg R: ${parseFloat(avgR)>0?'+':''}${avgR}</span>` : ''}
+    <span class="ctx-badge ctx-neutral">PF: ${pf}</span>
+    <span class="ctx-badge ${parseFloat(totalR)>=0?'ctx-bull':'ctx-bear'}">Total R: ${parseFloat(totalR)>0?'+':''}${totalR}</span>
+  </div>`}
+  ${opens.length > 0 ? `
+  <div class="section-title mt-2">Open Positions (${opens.length})</div>
+  ${opens.map(t => {
+    const dc = t.direction==='BULL'?'#00ff88':'#ff6666';
+    const elapsed = Math.round((Date.now()/1000 - t.open_ts)/60);
+    return `<div style="font-size:.74rem;padding:3px 0;border-bottom:1px solid #0d0d0d">
+      <span style="color:${dc};font-weight:600">${t.direction}</span>
+      <span class="ms-1 fw-bold">${t.ticker}</span>
+      <span class="ms-1" style="color:#777">entry $${t.entry.toFixed(2)}</span>
+      <span class="ms-1" style="color:#ff6666">SL $${t.stop.toFixed(2)}</span>
+      <span class="ms-1" style="color:#00ff88">TP $${t.tp.toFixed(2)}</span>
+      <span class="ms-2" style="color:#555">[${t.score}/${MAX_SCORE}]</span>
+      <span class="ms-2" style="color:#444">${elapsed}m ago</span>
+    </div>`;
+  }).join('')}` : ''}
+  ${ots.length > 0 ? `
+  <div class="section-title mt-2">Recent Closed</div>
+  <table style="width:100%;font-size:.72rem;border-collapse:collapse">
+    <thead><tr style="color:#444;text-transform:uppercase;font-size:.6rem">
+      <th style="padding:2px 4px">Time</th><th>Ticker</th><th>Dir</th>
+      <th>Result</th><th>R</th><th>Entry</th><th>Exit</th><th>Dur</th>
+    </tr></thead>
+    <tbody>
+    ${[...ots].reverse().slice(0,15).map(o => {
+      const dc  = o.direction==='BULL'?'#00ff88':'#ff6666';
+      const rc  = o.result==='WIN'?'#00ff88':o.result==='LOSS'?'#ff6666':'#888';
+      const ico = o.result==='WIN'?'✅':o.result==='LOSS'?'❌':'⏱';
+      const r   = o.r_multiple != null ? (o.r_multiple>0?'+':'')+o.r_multiple.toFixed(2) : '--';
+      const ts  = (o.open_time||'').slice(11,16);
+      return `<tr style="border-bottom:1px solid #0d0d0d">
+        <td style="color:#444;padding:2px 4px">${ts}</td>
+        <td style="font-weight:600">${o.ticker}</td>
+        <td style="color:${dc}">${o.direction}</td>
+        <td style="color:${rc}">${ico} ${o.result}</td>
+        <td style="color:${parseFloat(r)>=0?'#00ff88':'#ff6666'}">${r}</td>
+        <td style="color:#666">$${o.entry.toFixed(2)}</td>
+        <td style="color:#666">$${o.exit_price.toFixed(2)}</td>
+        <td style="color:#444">${o.elapsed_mins}m</td>
+      </tr>`;
+    }).join('')}
+    </tbody>
+  </table>` : ''}
+</div>`;
+
+  // ── Signal Stats section ────────────────────────────────────────────────────
   if (!signalLog || signalLog.length === 0) {
-    panel.innerHTML = `<span style="color:#555;font-size:.8rem">No signals logged yet. Signals appear once score ≥ ${LOG_SCORE_THRESH}.</span>`;
+    panel.innerHTML = tradesHtml +
+      `<span style="color:#555;font-size:.8rem">No signals logged yet. Signals appear once score ≥ ${LOG_SCORE_THRESH}.</span>`;
     return;
   }
 
@@ -1787,12 +1999,10 @@ function renderAnalytics() {
   const bearCnt   = src.filter(e => e.direction === 'BEAR').length;
   const volCnt    = src.filter(e => e.vol_spike).length;
 
-  // Per-ticker counts
   const byTicker = {};
   for (const e of src) byTicker[e.ticker] = (byTicker[e.ticker] || 0) + 1;
   const maxTkCnt = Math.max(...Object.values(byTicker), 1);
 
-  // Score distribution
   const scoreDist = {};
   for (let i = LOG_SCORE_THRESH; i <= MAX_SCORE; i++) scoreDist[i] = 0;
   for (const e of src) {
@@ -1801,20 +2011,12 @@ function renderAnalytics() {
   }
   const maxScoreCnt = Math.max(...Object.values(scoreDist), 1);
 
-  function miniBar(pct, color) {
-    return `<div style="flex:1;background:#1a1a1a;border-radius:3px;height:10px;min-width:40px">
-      <div style="width:${Math.round(pct)}%;background:${color};height:10px;border-radius:3px;transition:width .3s"></div>
-    </div>`;
-  }
-
-  // Top 5 signals
   const top5 = [...src].sort((a,b) =>
     Math.max(b.bull_score||0,b.bear_score||0) - Math.max(a.bull_score||0,a.bear_score||0)
   ).slice(0, 5);
 
-  panel.innerHTML = `
+  panel.innerHTML = tradesHtml + `
 <div class="row g-2">
-  <!-- Summary row -->
   <div class="col-12">
     <div class="d-flex flex-wrap gap-2" style="font-size:.78rem">
       <span style="color:#555">${label}:</span>
@@ -1824,8 +2026,6 @@ function renderAnalytics() {
       <span class="ctx-badge ctx-neutral">⚡ Vol ${volCnt} (${total?Math.round(volCnt/total*100):0}%)</span>
     </div>
   </div>
-
-  <!-- Per-ticker bars -->
   <div class="col-12 col-md-5">
     <div class="section-title">Signals by Ticker</div>
     ${Object.entries(byTicker).sort((a,b)=>b[1]-a[1]).map(([t, n]) =>
@@ -1836,8 +2036,6 @@ function renderAnalytics() {
       </div>`
     ).join('')}
   </div>
-
-  <!-- Score distribution -->
   <div class="col-12 col-md-4">
     <div class="section-title">Score Distribution</div>
     ${Object.entries(scoreDist).map(([s, n]) => {
@@ -1850,8 +2048,6 @@ function renderAnalytics() {
       </div>`;
     }).join('')}
   </div>
-
-  <!-- Top 5 setups -->
   <div class="col-12 col-md-3">
     <div class="section-title">Top Setups</div>
     ${top5.map(e => {
@@ -1900,13 +2096,18 @@ function renderLog() {
 // ── Main poll loop ────────────────────────────────────────────────────────────
 async function update() {
   try {
-    const res  = await fetch('/api/status');
+    const [res, resT] = await Promise.all([
+      fetch('/api/status'),
+      fetch('/api/outcomes'),
+    ]);
     const data = await res.json();
+    const tdata = resT.ok ? await resT.json() : {open_trades:[], outcomes:[]};
     allData      = data.tickers     || {};
     signalLog    = data.signal_log  || [];
     vixData      = data.vix         || null;
     econEvents   = data.econ_events || [];
     optionsData  = data.options_data || {};
+    tradesData   = tdata;
 
     const mktBadge = document.getElementById('mkt-badge');
     if (data.market_open) {
