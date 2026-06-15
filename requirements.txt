@@ -1,0 +1,6 @@
+polygon-api-client
+pandas
+pandas_ta
+numpy
+flask
+requests

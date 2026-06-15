@@ -1,0 +1,14 @@
+﻿version: '3.8'
+services:
+  scanner:
+    build: .
+    container_name: spx-scanner
+    restart: unless-stopped
+    ports:
+      - "5000:5000"
+      - "8080:8080"
+    env_file:
+      - .env
+    environment:
+      - POLYGON_API_KEY=kPCGtR_zU1MocdtP229dy79YHEYBO7Ra
+      - DISCORD_WEBHOOK=https://discord.com/api/webhooks/1502172772292366428/ETSxUaAZrlwQ4LAsH3n7aPSBwHytT61Ec9XtilYlxB6p6b0HX0C8rBwej295ehptJd7v
