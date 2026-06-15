@@ -13,6 +13,7 @@ from email.mime.text import MIMEText
 import pandas as pd
 import pandas_ta as ta
 import requests
+import yfinance as yf
 from flask import Flask, jsonify
 from polygon import RESTClient
 
@@ -31,7 +32,7 @@ WATCHLIST             = ["SPY", "QQQ", "IWM", "NVDA", "AAPL"]
 SIGNAL_LOG_FILE       = "/tmp/signal_log.json"
 CSV_LOG_FILE          = "/tmp/signals.csv"
 HISTORY_FILE_TMPL     = "/tmp/score_history_{}.json"
-MAX_SCORE             = 17       # 16 Phase-1 + VIX alignment (1pt per direction)
+MAX_SCORE             = 18       # 17 Phase-2 + Put/Call Ratio (1pt per direction)
 ALERT_COOLDOWN_SECS   = 900
 VOLUME_SPIKE_MULT     = 3.0
 ALERT_SCORE_THRESHOLD = 9
@@ -40,8 +41,13 @@ ATR_STOP_MULT         = 1.5      # stop loss = price ± 1.5×ATR
 ATR_TP_MULT           = 2.5      # take profit = price ± 2.5×ATR
 ACCOUNT_SIZE          = float(os.getenv("ACCOUNT_SIZE", "25000"))
 RISK_PCT              = 0.01     # risk 1% of account per trade
-BREADTH_BULL_THRESH   = 3   # tickers in BULL needed for "bull dominant" breadth
-BREADTH_BEAR_THRESH   = 3   # tickers in BEAR needed for "bear dominant" breadth
+BREADTH_BULL_THRESH   = 3        # tickers in BULL needed for "bull dominant" breadth
+BREADTH_BEAR_THRESH   = 3        # tickers in BEAR needed for "bear dominant" breadth
+PCR_BULL_THRESH       = 0.7      # put/call ratio below this = calls dominating = bullish
+PCR_BEAR_THRESH       = 1.2      # put/call ratio above this = puts dominating = bearish
+OPTIONS_REFRESH_SECS  = 300      # re-fetch options every 5 min
+ECON_REFRESH_SECS     = 3600     # re-fetch economic calendar hourly
+ECON_CAL_URL          = "https://nfs.faireconomy.media/ff_calendar_thisweek.json"
 
 print("=== SPX CONFLUENCE SCANNER STARTING ===", flush=True)
 
@@ -354,6 +360,10 @@ _blank_ticker = lambda t: {
     "pm_gap_pct":   None,
     "orb_high":     None,
     "orb_low":      None,
+    "pcr":          None,
+    "pcr_oi":       None,
+    "call_vol":     None,
+    "put_vol":      None,
     "bull_signals": {},
     "bear_signals": {},
     "history":      load_history(t),
@@ -362,6 +372,13 @@ _blank_ticker = lambda t: {
 
 dashboard_data = {t: _blank_ticker(t) for t in WATCHLIST}
 signal_log     = load_signal_log()
+
+# Economic calendar events for the current week
+econ_events  = []
+econ_fetched = None   # datetime of last fetch
+
+# Options flow per ticker (populated by yfinance, no Polygon rate limit)
+options_data = {}     # {ticker: {pcr, pcr_oi, call_vol, put_vol, expiry, last_update}}
 
 # Market breadth — computed from dashboard_data after each full scan cycle
 # Used as a free VIX proxy (no extra API call): bull_dominant ≈ VIX falling
@@ -385,10 +402,12 @@ def dashboard():
 @app.route('/api/status')
 def api_status():
     return jsonify({
-        "tickers":     dashboard_data,
-        "signal_log":  signal_log[-50:],
-        "market_open": is_market_open(),
-        "vix":         vix_data,
+        "tickers":      dashboard_data,
+        "signal_log":   signal_log[-50:],
+        "market_open":  is_market_open(),
+        "vix":          vix_data,
+        "econ_events":  econ_events,
+        "options_data": options_data,
     })
 
 
@@ -488,7 +507,7 @@ def fetch_aggs(client, ticker, multiplier, days, limit=500):
         return None
 
 
-def compute_signals(df_1m, df_5m):
+def compute_signals(df_1m, df_5m, ticker=None):
     # ── 1m indicators ──────────────────────────────────────────────────────────
     df = df_1m.copy()
     df['sma20'] = ta.sma(df['Close'], length=20)
@@ -641,6 +660,13 @@ def compute_signals(df_1m, df_5m):
     vix_bear  = breadth == "BEAR_DOMINANT"
     vix_label = f"{bc}B/{bec}b" if (bc + bec) > 0 else "--"
 
+    # ── Put/Call Ratio signal (uses global options_data, fetched via yfinance) ─
+    opts      = options_data.get(ticker, {}) if ticker else {}
+    pcr       = opts.get("pcr")
+    pcr_bull  = bool(_valid(pcr) and float(pcr) < PCR_BULL_THRESH)   # calls dominating
+    pcr_bear  = bool(_valid(pcr) and float(pcr) > PCR_BEAR_THRESH)   # puts dominating
+    pcr_label = f"{pcr:.2f}" if _valid(pcr) else "No data"
+
     # ── Signal builder helper ──────────────────────────────────────────────────
     def bs(label, pts, active, value, tf1=None, tf5=None):
         d = {"label": label, "points": pts, "active": bool(active), "value": value}
@@ -684,6 +710,7 @@ def compute_signals(df_1m, df_5m):
         "orb":         bs("ORB Break ↑",     1, orb_dir == 'bull',      f">{orb_high:.2f}" if orb_high else "No ORB"),
         "gap":         bs("Gap Up",          1, gap_dir == 'bull',      f"+{gap_pct:.2f}%" if (gap_pct is not None and gap_pct > 0) else (f"{gap_pct:.2f}%" if gap_pct is not None else "--")),
         "vix":         bs("Breadth Bull",     1, vix_bull,               vix_label),
+        "pcr":         bs("P/C Ratio Bull",   1, pcr_bull,               pcr_label),
     }
     bull_score = sum(s['points'] for s in bull.values() if s['active'])
 
@@ -721,6 +748,7 @@ def compute_signals(df_1m, df_5m):
         "orb":         bs("ORB Break ↓",      1, orb_dir == 'bear',     f"<{orb_low:.2f}" if orb_low else "No ORB"),
         "gap":         bs("Gap Down",         1, gap_dir == 'bear',     f"{gap_pct:.2f}%" if (gap_pct is not None and gap_pct < 0) else (f"+{gap_pct:.2f}%" if gap_pct is not None else "--")),
         "vix":         bs("Breadth Bear",     1, vix_bear,               vix_label),
+        "pcr":         bs("P/C Ratio Bear",   1, pcr_bear,               pcr_label),
     }
     bear_score = sum(s['points'] for s in bear.values() if s['active'])
 
@@ -751,6 +779,98 @@ def compute_signals(df_1m, df_5m):
         "orb_high":     orb_high,
         "orb_low":      orb_low,
     }
+
+
+def fetch_econ_calendar():
+    """Fetch this week's high-impact USD events from ForexFactory JSON feed."""
+    global econ_events, econ_fetched
+    try:
+        resp = requests.get(
+            ECON_CAL_URL,
+            timeout=10,
+            headers={"User-Agent": "Mozilla/5.0 (compatible; scanner/1.0)"},
+        )
+        if resp.status_code != 200:
+            print(f"Econ calendar HTTP {resp.status_code}", flush=True)
+            return
+        raw = resp.json()
+        # ET date for "today"
+        et_now   = datetime.now(timezone.utc) - timedelta(
+            hours=4 if _is_dst(datetime.now(timezone.utc)) else 5
+        )
+        today_et = et_now.date()
+        parsed   = []
+        for ev in raw:
+            if ev.get("country") != "USD" or ev.get("impact") != "High":
+                continue
+            try:
+                ev_date = datetime.strptime(ev["date"], "%b %d %Y").date()
+            except Exception:
+                continue
+            parsed.append({
+                "title":    ev.get("title", ""),
+                "date":     ev["date"],
+                "time":     ev.get("time", "All Day"),
+                "forecast": ev.get("forecast", ""),
+                "previous": ev.get("previous", ""),
+                "today":    ev_date == today_et,
+                "upcoming": ev_date >= today_et,
+            })
+        parsed.sort(key=lambda x: (x["date"], x["time"]))
+        econ_events  = parsed
+        econ_fetched = datetime.now()
+        today_count  = sum(1 for e in parsed if e["today"])
+        print(
+            f"Econ calendar: {len(parsed)} USD high-impact events this week"
+            f" ({today_count} today)", flush=True
+        )
+        for ev in parsed:
+            if ev["today"]:
+                print(f"  TODAY: {ev['title']} at {ev['time']}", flush=True)
+    except Exception as e:
+        print(f"Econ calendar error: {e}", flush=True)
+
+
+def fetch_options_flow(ticker_sym):
+    """Fetch options chain via yfinance and compute put/call ratio."""
+    global options_data
+    try:
+        t    = yf.Ticker(ticker_sym)
+        exps = t.options
+        if not exps:
+            print(f"Options [{ticker_sym}]: no expirations available", flush=True)
+            return
+        chain    = t.option_chain(exps[0])    # nearest expiry
+        calls    = chain.calls
+        puts     = chain.puts
+        call_vol = float(calls["volume"].fillna(0).sum())
+        put_vol  = float(puts["volume"].fillna(0).sum())
+        call_oi  = float(calls["openInterest"].fillna(0).sum())
+        put_oi   = float(puts["openInterest"].fillna(0).sum())
+        pcr_vol  = round(put_vol / call_vol, 3) if call_vol > 0 else None
+        pcr_oi   = round(put_oi  / call_oi,  3) if call_oi  > 0 else None
+        options_data[ticker_sym] = {
+            "pcr":         pcr_vol,
+            "pcr_oi":      pcr_oi,
+            "call_vol":    int(call_vol),
+            "put_vol":     int(put_vol),
+            "expiry":      exps[0],
+            "last_update": datetime.now().strftime("%H:%M:%S"),
+        }
+        # Update dashboard_data so it's visible immediately
+        if ticker_sym in dashboard_data:
+            dashboard_data[ticker_sym].update({
+                "pcr":      pcr_vol,
+                "pcr_oi":   pcr_oi,
+                "call_vol": int(call_vol),
+                "put_vol":  int(put_vol),
+            })
+        sent    = "bull" if (pcr_vol and pcr_vol < PCR_BULL_THRESH) else "bear" if (pcr_vol and pcr_vol > PCR_BEAR_THRESH) else "neutral"
+        pv_str  = f"{pcr_vol:.2f}" if pcr_vol is not None else "--"
+        poi_str = f"{pcr_oi:.2f}"  if pcr_oi  is not None else "--"
+        print(f"Options [{ticker_sym}] PCR: {pv_str} vol / {poi_str} OI (exp {exps[0]}) → {sent}", flush=True)
+    except Exception as e:
+        print(f"Options error [{ticker_sym}]: {e}", flush=True)
 
 
 def update_market_breadth():
@@ -819,7 +939,7 @@ async def scan_ticker(client, ticker, market_open):
     except Exception:
         pass
 
-    result    = compute_signals(df_1m, df_5m)
+    result    = compute_signals(df_1m, df_5m, ticker=ticker)
     price     = result['price']
     bull_score= result['bull_score']
     bear_score= result['bear_score']
@@ -864,6 +984,11 @@ async def scan_ticker(client, ticker, market_open):
         "pm_gap_pct":   pm_gap_pct,
         "orb_high":     result['orb_high'],
         "orb_low":      result['orb_low'],
+        # PCR from options_data (updated by fetch_options_flow, not per-scan)
+        "pcr":          options_data.get(ticker, {}).get("pcr"),
+        "pcr_oi":       options_data.get(ticker, {}).get("pcr_oi"),
+        "call_vol":     options_data.get(ticker, {}).get("call_vol"),
+        "put_vol":      options_data.get(ticker, {}).get("put_vol"),
         "bull_signals": result['bull_signals'],
         "bear_signals": result['bear_signals'],
         "history":      history,
@@ -917,12 +1042,32 @@ async def main():
         print("ERROR: POLYGON_API_KEY not set", flush=True)
         return
 
-    client = RESTClient(POLYGON_API_KEY)
+    client       = RESTClient(POLYGON_API_KEY)
+    loop         = asyncio.get_event_loop()
+    _econ_last   = None
+    _opts_last   = None
     print(f"Watchlist: {', '.join(WATCHLIST)}", flush=True)
 
     while True:
         try:
             market_open = is_market_open()
+            now         = datetime.now()
+
+            # Economic calendar: refresh hourly (runs in thread to avoid blocking)
+            if _econ_last is None or (now - _econ_last).total_seconds() > ECON_REFRESH_SECS:
+                await loop.run_in_executor(None, fetch_econ_calendar)
+                _econ_last = now
+
+            # Options flow: refresh every 5 min during market hours
+            if market_open and (
+                _opts_last is None or (now - _opts_last).total_seconds() > OPTIONS_REFRESH_SECS
+            ):
+                for t_sym in WATCHLIST:
+                    await loop.run_in_executor(None, fetch_options_flow, t_sym)
+                    await asyncio.sleep(0.5)
+                _opts_last = now
+
+            # Polygon ticker scans
             for ticker in WATCHLIST:
                 try:
                     await scan_ticker(client, ticker, market_open)
@@ -930,6 +1075,7 @@ async def main():
                     print(f"Error scanning {ticker}:", flush=True)
                     traceback.print_exc()
                 await asyncio.sleep(1)
+
             # Compute breadth from this cycle's results (no extra API call)
             update_market_breadth()
         except Exception:
@@ -1023,6 +1169,9 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     <button class="sound-btn on" id="sound-btn" onclick="toggleSound()">🔔 Sound ON</button>
   </div>
 
+  <!-- Economic Event Banner (today's high-impact events) -->
+  <div id="econ-banner" class="d-none mb-2 p-2" style="background:#1a0a00;border:1px solid #ff9900;border-radius:8px;font-size:.8rem;color:#ffcc00"></div>
+
   <!-- Ticker Summary Row -->
   <div class="row g-2 mb-3" id="ticker-row"></div>
 
@@ -1096,17 +1245,28 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     </div>
   </div>
 
+  <!-- Economic Calendar -->
+  <div class="card p-3 mt-3">
+    <div class="d-flex align-items-center gap-2 mb-2">
+      <div class="section-title mb-0">Economic Calendar — High Impact USD</div>
+      <span style="font-size:.65rem;color:#555" id="econ-updated"></span>
+    </div>
+    <div id="econ-list" style="font-size:.78rem"><span style="color:#555">Loading…</span></div>
+  </div>
+
 </div>
 
 <script>
-let allData    = {};
-let signalLog  = [];
-let vixData    = null;
-let curTicker  = 'SPY';
-let curDir     = 'bull';
-let soundOn    = true;
-let prevScores = {};
-let scoreChart = null;
+let allData      = {};
+let signalLog    = [];
+let vixData      = null;
+let econEvents   = [];
+let optionsData  = {};
+let curTicker    = 'SPY';
+let curDir       = 'bull';
+let soundOn      = true;
+let prevScores   = {};
+let scoreChart   = null;
 
 const MAX_SCORE = """ + str(MAX_SCORE) + """;
 
@@ -1241,6 +1401,15 @@ function renderContextRow() {
       html += `<span class="ctx-badge ctx-neutral">Inside ORB</span>`;
   }
 
+  // PCR chip
+  const d2 = allData[curTicker];
+  if (d2 && d2.pcr != null) {
+    const pcrCls = d2.pcr < """ + str(0.7) + """ ? 'ctx-bull' : d2.pcr > """ + str(1.2) + """ ? 'ctx-bear' : 'ctx-neutral';
+    html += `<span class="ctx-badge ${pcrCls}" title="Put/Call ratio (volume) — nearest expiry">P/C ${d2.pcr.toFixed(2)} ${d2.pcr<0.7?'↑calls':d2.pcr>1.2?'↑puts':'~'}</span>`;
+    if (d2.call_vol && d2.put_vol)
+      html += `<span class="ctx-badge ctx-neutral" title="Options volume">C:${(d2.call_vol/1000).toFixed(0)}k P:${(d2.put_vol/1000).toFixed(0)}k</span>`;
+  }
+
   row.innerHTML = html;
 }
 
@@ -1357,6 +1526,41 @@ function updateChart() {
   scoreChart.update('none');
 }
 
+// ── Economic calendar ─────────────────────────────────────────────────────────
+function renderEconCalendar() {
+  const list = document.getElementById('econ-list');
+  const banner = document.getElementById('econ-banner');
+  if (!list) return;
+  if (!econEvents || econEvents.length === 0) {
+    list.innerHTML = '<span style="color:#555">No high-impact USD events found for this week</span>';
+    banner.classList.add('d-none');
+    return;
+  }
+  const todayEvs = econEvents.filter(e => e.today);
+  if (todayEvs.length > 0) {
+    banner.innerHTML = '⚠️ <b>High Impact Today:</b> ' +
+      todayEvs.map(e => `${e.title} @ ${e.time}`).join(' &nbsp;|&nbsp; ');
+    banner.classList.remove('d-none');
+  } else {
+    banner.classList.add('d-none');
+  }
+  const upcomingEvs = econEvents.filter(e => e.upcoming);
+  const displayEvs  = upcomingEvs.length > 0 ? upcomingEvs : econEvents;
+  list.innerHTML = displayEvs.map(e => {
+    const todayCls = e.today ? 'color:#00ff88;font-weight:600' : 'color:#555';
+    const tag      = e.today ? ' <span style="color:#ffaa00;font-size:.65rem">TODAY</span>' : '';
+    return `<div style="padding:4px 0;border-bottom:1px solid #0d0d0d">
+      <span style="${todayCls}">${e.date}</span>
+      <span class="ms-2 fw-bold" style="color:${e.today?'#fff':'#aaa'}">${e.title}</span>${tag}
+      <span class="ms-2" style="color:#666">${e.time}</span>
+      ${e.forecast ? `<span class="ms-2" style="color:#555;font-size:.72rem">F: ${e.forecast}</span>` : ''}
+      ${e.previous ? `<span class="ms-1" style="color:#444;font-size:.72rem">P: ${e.previous}</span>` : ''}
+    </div>`;
+  }).join('');
+  const upd = document.getElementById('econ-updated');
+  if (upd && upcomingEvs.length === 0) upd.textContent = '(past events)';
+}
+
 // ── Signal log table ──────────────────────────────────────────────────────────
 function renderLog() {
   if (!signalLog || signalLog.length === 0) return;
@@ -1387,9 +1591,11 @@ async function update() {
   try {
     const res  = await fetch('/api/status');
     const data = await res.json();
-    allData   = data.tickers    || {};
-    signalLog = data.signal_log  || [];
-    vixData   = data.vix         || null;
+    allData      = data.tickers     || {};
+    signalLog    = data.signal_log  || [];
+    vixData      = data.vix         || null;
+    econEvents   = data.econ_events || [];
+    optionsData  = data.options_data || {};
 
     const mktBadge = document.getElementById('mkt-badge');
     if (data.market_open) {
@@ -1435,6 +1641,7 @@ async function update() {
     renderAlerts();
     updateChart();
     renderLog();
+    renderEconCalendar();
   } catch(e) {
     console.error('Update error:', e);
   }
