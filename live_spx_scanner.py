@@ -5,7 +5,7 @@ import math
 import os
 import threading
 import traceback
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, date, timedelta, timezone
 
 import pandas as pd
 import pandas_ta as ta
@@ -18,6 +18,7 @@ POLYGON_API_KEY = os.getenv("POLYGON_API_KEY")
 DISCORD_WEBHOOK = os.getenv("DISCORD_WEBHOOK")
 HISTORY_FILE = "/tmp/score_history.json"
 MAX_SCORE = 11
+ALERT_COOLDOWN_SECONDS = 900  # 15 minutes between alerts
 
 print("=== FULL SPX CONFLUENCE SCANNER STARTING ===", flush=True)
 
@@ -30,12 +31,87 @@ def _valid(v):
         return False
 
 
+def _easter(year):
+    """Return Easter Sunday as a date using the Anonymous Gregorian algorithm."""
+    a = year % 19
+    b, c = divmod(year, 100)
+    d, e = divmod(b, 4)
+    f = (b + 8) // 25
+    g = (b - f + 1) // 3
+    h = (19 * a + b - d - g + 15) % 30
+    i, k = divmod(c, 4)
+    l = (32 + 2 * e + 2 * i - h - k) % 7
+    m = (a + 11 * h + 22 * l) // 451
+    month = (h + l - 7 * m + 114) // 31
+    day = (h + l - 7 * m + 114) % 31 + 1
+    return date(year, month, day)
+
+
+def _us_market_holidays(year):
+    """Return the set of NYSE market holiday dates for a given year."""
+    import calendar
+
+    def nth_weekday(month, weekday, n):
+        first = date(year, month, 1)
+        delta = (weekday - first.weekday()) % 7
+        return first + timedelta(days=delta + (n - 1) * 7)
+
+    def last_weekday(month, weekday):
+        last = date(year, month, calendar.monthrange(year, month)[1])
+        return last - timedelta(days=(last.weekday() - weekday) % 7)
+
+    def observed(d):
+        if d.weekday() == 6: return d + timedelta(days=1)
+        if d.weekday() == 5: return d - timedelta(days=1)
+        return d
+
+    good_friday = _easter(year) - timedelta(days=2)
+
+    return {
+        observed(date(year, 1, 1)),   # New Year's Day
+        nth_weekday(1, 0, 3),         # MLK Day (3rd Mon Jan)
+        nth_weekday(2, 0, 3),         # Presidents' Day (3rd Mon Feb)
+        good_friday,                   # Good Friday
+        last_weekday(5, 0),           # Memorial Day (last Mon May)
+        observed(date(year, 6, 19)),  # Juneteenth
+        observed(date(year, 7, 4)),   # Independence Day
+        nth_weekday(9, 0, 1),         # Labor Day (1st Mon Sep)
+        nth_weekday(11, 3, 4),        # Thanksgiving (4th Thu Nov)
+        observed(date(year, 12, 25)), # Christmas
+    }
+
+
+_holiday_cache = {}
+
+def _is_holiday(d):
+    if d.year not in _holiday_cache:
+        _holiday_cache[d.year] = _us_market_holidays(d.year)
+    return d in _holiday_cache[d.year]
+
+
+def _is_dst(dt):
+    """True if dt (UTC-aware) falls within US Eastern Daylight Time."""
+    year = dt.year
+
+    def nth_sunday_utc(month, n, hour_utc):
+        first = datetime(year, month, 1, tzinfo=timezone.utc)
+        days_until_sun = (6 - first.weekday()) % 7
+        return first + timedelta(days=days_until_sun + (n - 1) * 7, hours=hour_utc)
+
+    # DST starts: 2nd Sun Mar at 2am EST → 7am UTC
+    dst_start = nth_sunday_utc(3, 2, 7)
+    # DST ends:   1st Sun Nov at 2am EDT → 6am UTC (clocks still EDT when transition happens)
+    dst_end   = nth_sunday_utc(11, 1, 6)
+    return dst_start <= dt < dst_end
+
+
 def is_market_open():
     now = datetime.now(timezone.utc)
     if now.weekday() >= 5:
         return False
-    # NYSE: 9:30-16:00 ET. EDT=UTC-4 (Mar-Nov), EST=UTC-5 (Nov-Mar)
-    utc_offset = 4 if 3 <= now.month <= 11 else 5
+    if _is_holiday(now.date()):
+        return False
+    utc_offset = 4 if _is_dst(now) else 5
     market_open  = now.replace(hour=9  + utc_offset, minute=30, second=0, microsecond=0)
     market_close = now.replace(hour=16 + utc_offset, minute=0,  second=0, microsecond=0)
     return market_open <= now <= market_close
@@ -57,8 +133,19 @@ def save_history(history):
         pass
 
 
+def _calc_ha_bull(df):
+    """Proper Heikin Ashi: ha_open[i] = (ha_open[i-1] + ha_close[i-1]) / 2."""
+    ha_close = (df['Open'] + df['High'] + df['Low'] + df['Close']) / 4
+    ha_open = ha_close.copy()
+    ha_open.iloc[0] = (df['Open'].iloc[0] + df['Close'].iloc[0]) / 2
+    for i in range(1, len(ha_open)):
+        ha_open.iloc[i] = (ha_open.iloc[i - 1] + ha_close.iloc[i - 1]) / 2
+    return bool(ha_close.iloc[-1] > ha_open.iloc[-1])
+
+
 # ====================== STATE ======================
 app = Flask(__name__)
+_last_alert_time = None
 
 dashboard_data = {
     "price":       0.0,
@@ -85,6 +172,14 @@ dashboard_data = {
 # ====================== DISCORD ======================
 
 def send_discord_alert(price, score, message="Strong Signal"):
+    global _last_alert_time
+    now = datetime.now()
+    if _last_alert_time:
+        elapsed = (now - _last_alert_time).total_seconds()
+        if elapsed < ALERT_COOLDOWN_SECONDS:
+            remaining = int(ALERT_COOLDOWN_SECONDS - elapsed)
+            print(f"Alert suppressed — cooldown ({remaining}s remaining)", flush=True)
+            return
     if not DISCORD_WEBHOOK:
         print("Discord webhook not configured", flush=True)
         return
@@ -95,12 +190,13 @@ def send_discord_alert(price, score, message="Strong Signal"):
                 f"**Price:** {price:.2f}\n"
                 f"**Score:** {score}/{MAX_SCORE}\n"
                 f"**Signal:** {message}\n"
-                f"**Time:** {datetime.now().strftime('%H:%M:%S')}"
+                f"**Time:** {now.strftime('%H:%M:%S')}"
             )
         }
         requests.post(DISCORD_WEBHOOK, json=payload, timeout=5)
+        _last_alert_time = now
         dashboard_data["alerts"].insert(0, {
-            "time":    datetime.now().strftime("%H:%M:%S"),
+            "time":    now.strftime("%H:%M:%S"),
             "price":   round(float(price), 2),
             "score":   score,
             "message": message,
@@ -240,7 +336,7 @@ const scoreChart = new Chart(ctx, {
         responsive: true,
         animation: { duration: 300 },
         scales: {
-            x: { ticks: { color: '#555', maxTicksLimit: 8, font: {size:10} }, grid: { color: '#1a1a1a' } },
+            x: { ticks: { color: '#555', maxTicksLimit: 10, font: {size:10} }, grid: { color: '#1a1a1a' } },
             y: { min: 0, max: 11, ticks: { color: '#555', stepSize: 1 }, grid: { color: '#1a1a1a' } }
         },
         plugins: { legend: { display: false } }
@@ -294,7 +390,6 @@ async function updateDashboard() {
 
         const maxScore = data.max_score || 11;
         document.getElementById('score-max').textContent = '/' + maxScore;
-
         document.getElementById('price').textContent = parseFloat(data.price).toFixed(2);
 
         const score = data.score;
@@ -305,10 +400,10 @@ async function updateDashboard() {
         document.getElementById('score-bar').style.width = Math.min(score / maxScore * 100, 100) + '%';
         document.getElementById('score-bar').style.background = color;
 
-        const badge = document.getElementById('status-badge');
+        const badge    = document.getElementById('status-badge');
         const statusEl = document.getElementById('scanner-status');
-        const dot = document.getElementById('live-dot');
-        const banner = document.getElementById('market-banner');
+        const dot      = document.getElementById('live-dot');
+        const banner   = document.getElementById('market-banner');
 
         badge.className = 'status-badge';
         if (data.status === 'NORMAL') {
@@ -332,7 +427,7 @@ async function updateDashboard() {
             dot.className = 'live-dot';
             banner.classList.add('d-none');
         }
-        badge.textContent = data.status;
+        badge.textContent  = data.status;
         statusEl.textContent = data.status;
 
         document.getElementById('last_update').textContent = data.last_update;
@@ -405,8 +500,12 @@ def test_alert():
 
 def detect_fvg(df):
     try:
-        bullish = (df['Low'].shift(-1) > df['High'].shift(2)).iloc[-1]
-        bearish = (df['High'].shift(-1) < df['Low'].shift(2)).iloc[-1]
+        if len(df) < 3:
+            return False
+        # Bullish FVG: current low > high from 2 candles ago (price gap up)
+        bullish = df['Low'].iloc[-1] > df['High'].iloc[-3]
+        # Bearish FVG: current high < low from 2 candles ago (price gap down)
+        bearish = df['High'].iloc[-1] < df['Low'].iloc[-3]
         return bool(bullish or bearish)
     except Exception:
         return False
@@ -500,10 +599,8 @@ async def main():
 
             df = df.bfill()
 
-            # Heikin Ashi
-            ha_close = (df['Open'] + df['High'] + df['Low'] + df['Close']) / 4
-            ha_open  = ha_close.shift(1)
-            ha_bull  = bool(ha_close.iloc[-1] > ha_open.iloc[-1])
+            # Heikin Ashi (proper recursive calculation)
+            ha_bull = _calc_ha_bull(df)
 
             # FTFC
             ftfc = (df['Close'] > df['Open']).rolling(30).mean().iloc[-1]
@@ -558,11 +655,14 @@ async def main():
                 "ob":          {"value": "Active" if ob_active  else "None",                "active": bool(ob_active),    "label": "Order Block",  "points": 1},
             }
 
+            # Append to history only once per minute to avoid duplicate chart labels
             history = dashboard_data["history"]
-            history.append({"time": datetime.now().strftime("%H:%M"), "score": int(score)})
-            if len(history) > 60:
-                history.pop(0)
-            save_history(history)
+            current_minute = datetime.now().strftime("%H:%M")
+            if not history or history[-1]["time"] != current_minute:
+                history.append({"time": current_minute, "score": int(score)})
+                if len(history) > 60:
+                    history.pop(0)
+                save_history(history)
 
             dashboard_data.update({
                 "price":       round(float(current_price), 2),
@@ -583,7 +683,6 @@ async def main():
                 flush=True
             )
 
-            # Poll less often when market is closed
             await asyncio.sleep(300 if not market_open else 45)
 
         except Exception:
@@ -593,7 +692,7 @@ async def main():
 
 
 # ====================== START ======================
-# Start scanner thread at module level so gunicorn picks it up
+# Start at module level so gunicorn workers pick it up
 threading.Thread(
     target=lambda: asyncio.run(main()),
     daemon=True
