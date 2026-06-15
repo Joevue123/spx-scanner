@@ -185,6 +185,84 @@ def log_to_csv(row: dict):
         pass
 
 
+def build_daily_summary() -> str:
+    """Read today's CSV entries and return a plain-text summary."""
+    today_str = date.today().isoformat()
+    rows = []
+    try:
+        if os.path.isfile(CSV_LOG_FILE):
+            with open(CSV_LOG_FILE, newline="") as f:
+                reader = csv.DictReader(f)
+                for r in reader:
+                    if r.get("time", "").startswith(today_str):
+                        rows.append(r)
+    except Exception:
+        pass
+
+    lines = [
+        f"SPX Confluence Scanner — Daily Summary {today_str}",
+        f"Watchlist: {', '.join(WATCHLIST)}",
+        "=" * 55,
+        f"Total logged signals today: {len(rows)}",
+        "",
+    ]
+
+    if not rows:
+        lines.append("No signals met the logging threshold today.")
+        return "\n".join(lines)
+
+    # Per-ticker breakdown
+    by_ticker: dict = {}
+    for r in rows:
+        t = r.get("ticker", "?")
+        by_ticker.setdefault(t, []).append(r)
+
+    lines.append("--- Per-Ticker Breakdown ---")
+    for ticker, trows in sorted(by_ticker.items()):
+        bull_rows = [r for r in trows if r.get("direction") == "BULL"]
+        bear_rows = [r for r in trows if r.get("direction") == "BEAR"]
+        best_bull = max((int(r.get("bull_score", 0)) for r in bull_rows), default=0)
+        best_bear = max((int(r.get("bear_score", 0)) for r in bear_rows), default=0)
+        lines.append(
+            f"  {ticker}: {len(trows)} signals | "
+            f"Bull {len(bull_rows)} (best {best_bull}/{MAX_SCORE}) | "
+            f"Bear {len(bear_rows)} (best {best_bear}/{MAX_SCORE})"
+        )
+
+    # Top signals overall
+    top_n = sorted(
+        rows,
+        key=lambda r: max(int(r.get("bull_score", 0)), int(r.get("bear_score", 0))),
+        reverse=True,
+    )[:10]
+
+    lines += ["", "--- Top Signals Today (by score) ---"]
+    for r in top_n:
+        bs = int(r.get("bull_score", 0)); brs = int(r.get("bear_score", 0))
+        score = max(bs, brs)
+        vol   = " VOL" if r.get("vol_spike") in (True, "True") else ""
+        gap   = f" gap {float(r['gap_pct']):+.2f}%" if r.get("gap_pct") not in (None, "", "None") else ""
+        lines.append(
+            f"  {r.get('time','?')} | {r.get('ticker','?'):5s} ${float(r.get('price',0)):.2f} "
+            f"| {r.get('direction','?'):4s} {score}/{MAX_SCORE}{vol}{gap}"
+        )
+
+    # Volume spike count
+    vol_count = sum(1 for r in rows if r.get("vol_spike") in (True, "True"))
+    lines += ["", f"Volume spikes: {vol_count}", ""]
+    lines.append("-- End of daily summary --")
+    return "\n".join(lines)
+
+
+def send_daily_summary():
+    summary = build_daily_summary()
+    print(summary, flush=True)
+    _send_email(
+        subject=f"[SPX Scanner] Daily Summary {date.today().isoformat()}",
+        body=summary,
+    )
+
+
 # ====================== INDICATORS ======================
 
 def _calc_ha_bull(df):
@@ -435,6 +513,26 @@ def health():
         "watchlist":   WATCHLIST,
         "time":        datetime.now().strftime("%H:%M:%S"),
     })
+
+
+@app.route('/api/download-csv')
+def download_csv():
+    from flask import send_file, abort
+    if not os.path.isfile(CSV_LOG_FILE):
+        abort(404, description="No CSV log yet")
+    return send_file(
+        CSV_LOG_FILE,
+        mimetype='text/csv',
+        as_attachment=True,
+        download_name=f"spx_signals_{date.today().isoformat()}.csv",
+    )
+
+
+@app.route('/test-daily-summary')
+def test_daily_summary():
+    import threading
+    threading.Thread(target=send_daily_summary, daemon=True).start()
+    return jsonify({"status": "daily summary triggered"})
 
 
 @app.route('/test-alert')
@@ -1042,10 +1140,11 @@ async def main():
         print("ERROR: POLYGON_API_KEY not set", flush=True)
         return
 
-    client       = RESTClient(POLYGON_API_KEY)
-    loop         = asyncio.get_event_loop()
-    _econ_last   = None
-    _opts_last   = None
+    client          = RESTClient(POLYGON_API_KEY)
+    loop            = asyncio.get_event_loop()
+    _econ_last      = None
+    _opts_last      = None
+    _summary_sent   = None   # date on which daily summary was sent
     print(f"Watchlist: {', '.join(WATCHLIST)}", flush=True)
 
     while True:
@@ -1078,6 +1177,20 @@ async def main():
 
             # Compute breadth from this cycle's results (no extra API call)
             update_market_breadth()
+
+            # Daily summary: send once after 16:05 ET on trading days
+            et_now = datetime.now(timezone.utc).astimezone(
+                __import__('zoneinfo', fromlist=['ZoneInfo']).ZoneInfo('America/New_York')
+            )
+            today = et_now.date()
+            if (
+                et_now.hour == 16 and et_now.minute >= 5
+                and _summary_sent != today
+                and today.weekday() < 5   # Mon–Fri only
+            ):
+                await loop.run_in_executor(None, send_daily_summary)
+                _summary_sent = today
+
         except Exception:
             traceback.print_exc()
 
@@ -1167,6 +1280,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     <span id="vix-badge" class="ctx-badge ctx-neutral" title="VIXY (VIX proxy) — falling=bullish, rising=bearish">VIX --</span>
     <span class="ms-auto text-muted" style="font-size:.72rem">Updated: <span id="last-update">--</span></span>
     <button class="sound-btn on" id="sound-btn" onclick="toggleSound()">🔔 Sound ON</button>
+    <a href="/api/download-csv" class="sound-btn" style="text-decoration:none;font-size:.72rem" title="Download today&#39;s signal log as CSV">⬇ CSV</a>
   </div>
 
   <!-- Economic Event Banner (today's high-impact events) -->
