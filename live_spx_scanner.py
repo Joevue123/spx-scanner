@@ -528,6 +528,19 @@ def download_csv():
     )
 
 
+@app.route('/manifest.json')
+def pwa_manifest():
+    return jsonify({
+        "name": "SPX Confluence Scanner",
+        "short_name": "SPX Scanner",
+        "display": "standalone",
+        "background_color": "#0a0a0a",
+        "theme_color": "#00ffcc",
+        "start_url": "/",
+        "icons": [],
+    })
+
+
 @app.route('/test-daily-summary')
 def test_daily_summary():
     import threading
@@ -1203,7 +1216,12 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="theme-color" content="#00ffcc">
+<link rel="manifest" href="/manifest.json">
 <title>SPX Confluence Scanner</title>
 <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet">
 <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
@@ -1263,9 +1281,22 @@ DASHBOARD_HTML = """<!DOCTYPE html>
   .ctx-neutral{background:#22222288;color:#888;border:1px solid #333}
   /* Mobile tweaks */
   @media(max-width:576px){
-    .tcrd{padding:9px 10px}
-    .tcrd .t-price{font-size:1.1rem}
-    h1{font-size:1.1rem}
+    body{font-size:.85rem;padding:8px!important}
+    h1{font-size:1rem}
+    .tcrd{padding:8px 9px}
+    .tcrd .t-price{font-size:1rem}
+    .tab-btn{padding:6px 12px;font-size:.8rem;min-height:36px}
+    .sound-btn{padding:5px 10px;min-height:36px}
+    .risk-chip{padding:5px 9px}
+    .col-6.col-sm-4.col-md-3.col-xl-2{flex:0 0 50%}
+    .sig-card{padding:6px 8px}
+    .log-table{font-size:.68rem}
+    .log-table th,.log-table td{padding:3px 5px}
+    /* hide TradingView iframes on very small screens */
+    .tv-hide-mobile{display:none!important}
+  }
+  @media(display-mode:standalone){
+    body{padding-top:max(env(safe-area-inset-top),8px)!important}
   }
 </style>
 </head>
@@ -1280,6 +1311,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     <span id="vix-badge" class="ctx-badge ctx-neutral" title="VIXY (VIX proxy) — falling=bullish, rising=bearish">VIX --</span>
     <span class="ms-auto text-muted" style="font-size:.72rem">Updated: <span id="last-update">--</span></span>
     <button class="sound-btn on" id="sound-btn" onclick="toggleSound()">🔔 Sound ON</button>
+    <button class="sound-btn" id="notif-btn" onclick="requestNotifPermission()" title="Enable browser push notifications">🔔 Enable Alerts</button>
     <a href="/api/download-csv" class="sound-btn" style="text-decoration:none;font-size:.72rem" title="Download today&#39;s signal log as CSV">⬇ CSV</a>
   </div>
 
@@ -1294,9 +1326,10 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     <!-- Tab bar -->
     <div class="d-flex align-items-center gap-2 mb-2 flex-wrap">
       <div class="section-title mb-0" id="detail-title">SPY — Signals</div>
-      <div class="d-flex gap-1">
-        <button class="tab-btn active" id="tab-bull" onclick="setDir('bull')">🔼 Bull</button>
-        <button class="tab-btn"        id="tab-bear" onclick="setDir('bear')">🔽 Bear</button>
+      <div class="d-flex gap-1 flex-wrap">
+        <button class="tab-btn active" id="tab-bull" onclick="setTab('bull')">🔼 Bull</button>
+        <button class="tab-btn"        id="tab-bear" onclick="setTab('bear')">🔽 Bear</button>
+        <button class="tab-btn"        id="tab-stats" onclick="setTab('analytics')">📊 Stats</button>
       </div>
       <span id="vol-spike-badge" class="vol-spike d-none">⚡ VOL SPIKE</span>
     </div>
@@ -1304,14 +1337,18 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     <!-- Context row: Gap + ORB -->
     <div id="ctx-row" class="mb-2"></div>
 
-    <!-- Signal Grid -->
-    <div class="row g-2 mb-3" id="signal-grid"></div>
-
-    <!-- ATR Risk Panel -->
-    <div>
-      <div class="section-title">ATR Risk Levels</div>
-      <div id="risk-panel" class="d-flex flex-wrap gap-1"></div>
+    <!-- Signal Grid (hidden when analytics tab active) -->
+    <div id="signals-section">
+      <div class="row g-2 mb-3" id="signal-grid"></div>
+      <!-- ATR Risk Panel -->
+      <div id="risk-section">
+        <div class="section-title">ATR Risk Levels</div>
+        <div id="risk-panel" class="d-flex flex-wrap gap-1"></div>
+      </div>
     </div>
+
+    <!-- Analytics Panel -->
+    <div id="analytics-panel" class="d-none"></div>
   </div>
 
   <!-- Charts + Alerts Row -->
@@ -1334,8 +1371,8 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         <iframe id="tv-frame"
           src="https://www.tradingview.com/widgetembed/?symbol=AMEX:SPY&interval=1&theme=dark"
           width="100%" height="160" frameborder="0"></iframe>
-        <div class="section-title mt-2">VIX (CBOE)</div>
-        <iframe
+        <div class="section-title mt-2 tv-hide-mobile">VIX (CBOE)</div>
+        <iframe class="tv-hide-mobile"
           src="https://www.tradingview.com/widgetembed/?symbol=TVC:VIX&interval=D&theme=dark"
           width="100%" height="50" frameborder="0" style="border-radius:4px"></iframe>
       </div>
@@ -1382,7 +1419,9 @@ let soundOn      = true;
 let prevScores   = {};
 let scoreChart   = null;
 
-const MAX_SCORE = """ + str(MAX_SCORE) + """;
+const MAX_SCORE           = """ + str(MAX_SCORE) + """;
+const ALERT_SCORE_THRESH  = """ + str(ALERT_SCORE_THRESHOLD) + """;
+const LOG_SCORE_THRESH    = """ + str(LOG_SCORE_THRESHOLD) + """;
 
 const TV_SYMBOLS = {
   SPY:'AMEX:SPY', QQQ:'NASDAQ:QQQ', IWM:'AMEX:IWM',
@@ -1409,6 +1448,39 @@ function playAlert(freq, count) {
     gain.gain.exponentialRampToValueAtTime(0.001, t + 0.25);
     osc.start(t); osc.stop(t + 0.25);
   }
+}
+
+// ── Browser push notifications ────────────────────────────────────────────────
+let notifGranted = false;
+
+function updateNotifBtn() {
+  const btn = document.getElementById('notif-btn');
+  if (!btn) return;
+  if (!('Notification' in window)) { btn.style.display='none'; return; }
+  const p = Notification.permission;
+  notifGranted = p === 'granted';
+  if (p === 'granted')  { btn.textContent='🔔 Alerts ON'; btn.className='sound-btn on'; }
+  else if (p === 'denied') { btn.textContent='🔕 Blocked'; btn.className='sound-btn'; btn.disabled=true; }
+  else                  { btn.textContent='🔔 Enable Alerts'; btn.className='sound-btn'; }
+}
+
+async function requestNotifPermission() {
+  if (!('Notification' in window)) return;
+  if (Notification.permission === 'granted') return;
+  await Notification.requestPermission();
+  updateNotifBtn();
+}
+
+function fireNotification(ticker, direction, score) {
+  if (!notifGranted) return;
+  const emoji = direction === 'BULL' ? '🚀' : '🔻';
+  try {
+    new Notification(`${emoji} ${ticker} ${direction} — ${score}/${MAX_SCORE}`, {
+      body: `Confluence score ${score}/${MAX_SCORE} — check the scanner`,
+      tag: ticker,
+      silent: false,
+    });
+  } catch(e) {}
 }
 
 function scoreColor(s) {
@@ -1475,13 +1547,35 @@ function selectTicker(t) {
     `https://www.tradingview.com/widgetembed/?symbol=${TV_SYMBOLS[t]||'AMEX:SPY'}&interval=1&theme=dark`;
 }
 
-// ── Direction tabs ────────────────────────────────────────────────────────────
+// ── Tab / direction system ────────────────────────────────────────────────────
+let curTab = 'bull'; // 'bull' | 'bear' | 'analytics'
+
 function setDir(dir) {
   curDir = dir;
   document.getElementById('tab-bull').className = 'tab-btn' + (dir==='bull'?' active':'');
   document.getElementById('tab-bear').className = 'tab-btn' + (dir==='bear'?' active':'');
-  renderSignals();
-  renderRiskPanel();
+  document.getElementById('tab-stats').className = 'tab-btn';
+}
+
+function setTab(tab) {
+  curTab = tab;
+  const sigSec  = document.getElementById('signals-section');
+  const anaSec  = document.getElementById('analytics-panel');
+  if (tab === 'analytics') {
+    sigSec.classList.add('d-none');
+    anaSec.classList.remove('d-none');
+    document.getElementById('tab-bull').className  = 'tab-btn';
+    document.getElementById('tab-bear').className  = 'tab-btn';
+    document.getElementById('tab-stats').className = 'tab-btn active';
+    renderAnalytics();
+  } else {
+    sigSec.classList.remove('d-none');
+    anaSec.classList.add('d-none');
+    curDir = tab;
+    setDir(tab);
+    renderSignals();
+    renderRiskPanel();
+  }
 }
 
 // ── Context row (Gap + ORB + Pre-market Gap) ─────────────────────────────────
@@ -1675,6 +1769,109 @@ function renderEconCalendar() {
   if (upd && upcomingEvs.length === 0) upd.textContent = '(past events)';
 }
 
+// ── Signal Analytics tab ──────────────────────────────────────────────────────
+function renderAnalytics() {
+  const panel = document.getElementById('analytics-panel');
+  if (!panel) return;
+  if (!signalLog || signalLog.length === 0) {
+    panel.innerHTML = `<span style="color:#555;font-size:.8rem">No signals logged yet. Signals appear once score ≥ ${LOG_SCORE_THRESH}.</span>`;
+    return;
+  }
+
+  const today     = new Date().toISOString().slice(0, 10);
+  const todaySigs = signalLog.filter(e => e.time && e.time.startsWith(today));
+  const src       = todaySigs.length > 0 ? todaySigs : signalLog;
+  const label     = todaySigs.length > 0 ? 'Today' : 'All-time';
+  const total     = src.length;
+  const bullCnt   = src.filter(e => e.direction === 'BULL').length;
+  const bearCnt   = src.filter(e => e.direction === 'BEAR').length;
+  const volCnt    = src.filter(e => e.vol_spike).length;
+
+  // Per-ticker counts
+  const byTicker = {};
+  for (const e of src) byTicker[e.ticker] = (byTicker[e.ticker] || 0) + 1;
+  const maxTkCnt = Math.max(...Object.values(byTicker), 1);
+
+  // Score distribution
+  const scoreDist = {};
+  for (let i = LOG_SCORE_THRESH; i <= MAX_SCORE; i++) scoreDist[i] = 0;
+  for (const e of src) {
+    const s = Math.max(e.bull_score || 0, e.bear_score || 0);
+    if (s >= LOG_SCORE_THRESH) scoreDist[s] = (scoreDist[s] || 0) + 1;
+  }
+  const maxScoreCnt = Math.max(...Object.values(scoreDist), 1);
+
+  function miniBar(pct, color) {
+    return `<div style="flex:1;background:#1a1a1a;border-radius:3px;height:10px;min-width:40px">
+      <div style="width:${Math.round(pct)}%;background:${color};height:10px;border-radius:3px;transition:width .3s"></div>
+    </div>`;
+  }
+
+  // Top 5 signals
+  const top5 = [...src].sort((a,b) =>
+    Math.max(b.bull_score||0,b.bear_score||0) - Math.max(a.bull_score||0,a.bear_score||0)
+  ).slice(0, 5);
+
+  panel.innerHTML = `
+<div class="row g-2">
+  <!-- Summary row -->
+  <div class="col-12">
+    <div class="d-flex flex-wrap gap-2" style="font-size:.78rem">
+      <span style="color:#555">${label}:</span>
+      <span style="color:#fff;font-weight:600">${total} signals</span>
+      <span class="ctx-badge ctx-bull">▲ Bull ${bullCnt} (${total?Math.round(bullCnt/total*100):0}%)</span>
+      <span class="ctx-badge ctx-bear">▼ Bear ${bearCnt} (${total?Math.round(bearCnt/total*100):0}%)</span>
+      <span class="ctx-badge ctx-neutral">⚡ Vol ${volCnt} (${total?Math.round(volCnt/total*100):0}%)</span>
+    </div>
+  </div>
+
+  <!-- Per-ticker bars -->
+  <div class="col-12 col-md-5">
+    <div class="section-title">Signals by Ticker</div>
+    ${Object.entries(byTicker).sort((a,b)=>b[1]-a[1]).map(([t, n]) =>
+      `<div class="d-flex align-items-center gap-2 mb-1" style="font-size:.76rem">
+        <span style="width:36px;color:#aaa">${t}</span>
+        ${miniBar(n/maxTkCnt*100, '#00ffcc')}
+        <span style="width:18px;color:#555;text-align:right">${n}</span>
+      </div>`
+    ).join('')}
+  </div>
+
+  <!-- Score distribution -->
+  <div class="col-12 col-md-4">
+    <div class="section-title">Score Distribution</div>
+    ${Object.entries(scoreDist).map(([s, n]) => {
+      const si = parseInt(s);
+      const color = si >= 13 ? '#00ff88' : si >= 10 ? '#aaff00' : si >= ALERT_SCORE_THRESH ? '#ffaa00' : '#ff6666';
+      return `<div class="d-flex align-items-center gap-2 mb-1" style="font-size:.76rem">
+        <span style="width:18px;color:#555;text-align:right">${s}</span>
+        ${miniBar(n/maxScoreCnt*100, color)}
+        <span style="width:18px;color:#555;text-align:right">${n}</span>
+      </div>`;
+    }).join('')}
+  </div>
+
+  <!-- Top 5 setups -->
+  <div class="col-12 col-md-3">
+    <div class="section-title">Top Setups</div>
+    ${top5.map(e => {
+      const score = Math.max(e.bull_score||0, e.bear_score||0);
+      const dc    = e.direction==='BULL'?'#00ff88':'#ff6666';
+      const vol   = e.vol_spike ? ' ⚡' : '';
+      const gap   = e.gap_pct != null ? ` ${e.gap_pct>0?'+':''}${parseFloat(e.gap_pct).toFixed(1)}%` : '';
+      const ts    = (e.time||'').slice(11,16);
+      return `<div style="padding:4px 0;border-bottom:1px solid #111;font-size:.73rem">
+        <span style="color:#555">${ts}</span>
+        <span class="ms-1 fw-bold">${e.ticker}</span>
+        <span class="ms-1" style="color:#777">$${parseFloat(e.price||0).toFixed(0)}</span>
+        <span class="ms-1 fw-bold" style="color:${dc}">${e.direction}</span>
+        <span class="ms-1" style="color:#aaa">${score}/${MAX_SCORE}${vol}${gap}</span>
+      </div>`;
+    }).join('')}
+  </div>
+</div>`;
+}
+
 // ── Signal log table ──────────────────────────────────────────────────────────
 function renderLog() {
   if (!signalLog || signalLog.length === 0) return;
@@ -1741,16 +1938,18 @@ async function update() {
       const prev    = prevScores[ticker] || {bull:0,bear:0};
       const newMax  = Math.max(d.bull_score, d.bear_score);
       const prevMax = Math.max(prev.bull,    prev.bear);
-      if (newMax >= 8 && newMax > prevMax)
+      if (newMax >= 8 && newMax > prevMax) {
         playAlert(newMax >= 11 ? 1100 : 880, newMax >= 11 ? 3 : 2);
+        if (newMax >= ALERT_SCORE_THRESH) fireNotification(ticker, d.direction, newMax);
+      }
       prevScores[ticker] = {bull: d.bull_score, bear: d.bear_score};
       if (d.last_update !== 'N/A') latestUpdate = d.last_update;
     }
     document.getElementById('last-update').textContent = latestUpdate;
 
     renderTickerRow();
-    renderSignals();
-    renderRiskPanel();
+    if (curTab === 'analytics') renderAnalytics();
+    else { renderSignals(); renderRiskPanel(); }
     renderContextRow();
     renderAlerts();
     updateChart();
@@ -1762,6 +1961,7 @@ async function update() {
 }
 
 initChart();
+updateNotifBtn();
 update();
 setInterval(update, 5000);
 </script>
