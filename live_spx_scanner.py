@@ -31,7 +31,7 @@ WATCHLIST             = ["SPY", "QQQ", "IWM", "NVDA", "AAPL"]
 SIGNAL_LOG_FILE       = "/tmp/signal_log.json"
 CSV_LOG_FILE          = "/tmp/signals.csv"
 HISTORY_FILE_TMPL     = "/tmp/score_history_{}.json"
-MAX_SCORE             = 16       # 12 existing + BB(1) + MACD(1) + ORB(1) + Gap(1)
+MAX_SCORE             = 17       # 16 Phase-1 + VIX alignment (1pt per direction)
 ALERT_COOLDOWN_SECS   = 900
 VOLUME_SPIKE_MULT     = 3.0
 ALERT_SCORE_THRESHOLD = 9
@@ -40,6 +40,8 @@ ATR_STOP_MULT         = 1.5      # stop loss = price ± 1.5×ATR
 ATR_TP_MULT           = 2.5      # take profit = price ± 2.5×ATR
 ACCOUNT_SIZE          = float(os.getenv("ACCOUNT_SIZE", "25000"))
 RISK_PCT              = 0.01     # risk 1% of account per trade
+BREADTH_BULL_THRESH   = 3   # tickers in BULL needed for "bull dominant" breadth
+BREADTH_BEAR_THRESH   = 3   # tickers in BEAR needed for "bear dominant" breadth
 
 print("=== SPX CONFLUENCE SCANNER STARTING ===", flush=True)
 
@@ -349,6 +351,7 @@ _blank_ticker = lambda t: {
     "pos_size":     None,
     "gap_pct":      None,
     "gap_dir":      None,
+    "pm_gap_pct":   None,
     "orb_high":     None,
     "orb_low":      None,
     "bull_signals": {},
@@ -359,6 +362,18 @@ _blank_ticker = lambda t: {
 
 dashboard_data = {t: _blank_ticker(t) for t in WATCHLIST}
 signal_log     = load_signal_log()
+
+# Market breadth — computed from dashboard_data after each full scan cycle
+# Used as a free VIX proxy (no extra API call): bull_dominant ≈ VIX falling
+vix_data = {
+    "level":       None,        # actual VIX: see TradingView widget
+    "trend":       None,        # "falling" | "rising" | None — derived from breadth
+    "pct_chg":     None,
+    "bull_count":  0,
+    "bear_count":  0,
+    "breadth":     "NEUTRAL",   # "BULL_DOMINANT" | "BEAR_DOMINANT" | "MIXED" | "NEUTRAL"
+    "last_update": None,
+}
 
 # ====================== ROUTES ======================
 
@@ -373,6 +388,7 @@ def api_status():
         "tickers":     dashboard_data,
         "signal_log":  signal_log[-50:],
         "market_open": is_market_open(),
+        "vix":         vix_data,
     })
 
 
@@ -615,6 +631,16 @@ def compute_signals(df_1m, df_5m):
         elif price < orb_low:
             orb_dir = 'bear'
 
+    # ── Market breadth signal (uses global vix_data, populated after each cycle) ─
+    breadth   = vix_data.get("breadth", "NEUTRAL")
+    bc        = vix_data.get("bull_count", 0)
+    bec       = vix_data.get("bear_count", 0)
+    # Bull: majority of watchlist tickers are bullish (breadth confirms)
+    vix_bull  = breadth == "BULL_DOMINANT"
+    # Bear: majority of watchlist tickers are bearish
+    vix_bear  = breadth == "BEAR_DOMINANT"
+    vix_label = f"{bc}B/{bec}b" if (bc + bec) > 0 else "--"
+
     # ── Signal builder helper ──────────────────────────────────────────────────
     def bs(label, pts, active, value, tf1=None, tf5=None):
         d = {"label": label, "points": pts, "active": bool(active), "value": value}
@@ -657,6 +683,7 @@ def compute_signals(df_1m, df_5m):
         "macd":        bs("MACD Cross ↑",    1, macd_b,                 f"{macd_val:.3f}" if macd_val is not None else "--"),
         "orb":         bs("ORB Break ↑",     1, orb_dir == 'bull',      f">{orb_high:.2f}" if orb_high else "No ORB"),
         "gap":         bs("Gap Up",          1, gap_dir == 'bull',      f"+{gap_pct:.2f}%" if (gap_pct is not None and gap_pct > 0) else (f"{gap_pct:.2f}%" if gap_pct is not None else "--")),
+        "vix":         bs("Breadth Bull",     1, vix_bull,               vix_label),
     }
     bull_score = sum(s['points'] for s in bull.values() if s['active'])
 
@@ -693,6 +720,7 @@ def compute_signals(df_1m, df_5m):
         "macd":        bs("MACD Cross ↓",     1, macd_r,                f"{macd_val:.3f}" if macd_val is not None else "--"),
         "orb":         bs("ORB Break ↓",      1, orb_dir == 'bear',     f"<{orb_low:.2f}" if orb_low else "No ORB"),
         "gap":         bs("Gap Down",         1, gap_dir == 'bear',     f"{gap_pct:.2f}%" if (gap_pct is not None and gap_pct < 0) else (f"+{gap_pct:.2f}%" if gap_pct is not None else "--")),
+        "vix":         bs("Breadth Bear",     1, vix_bear,               vix_label),
     }
     bear_score = sum(s['points'] for s in bear.values() if s['active'])
 
@@ -725,6 +753,33 @@ def compute_signals(df_1m, df_5m):
     }
 
 
+def update_market_breadth():
+    """Recompute breadth from current dashboard_data. No API call needed."""
+    global vix_data
+    bull_count = sum(1 for d in dashboard_data.values() if d.get('direction') == 'BULL')
+    bear_count = sum(1 for d in dashboard_data.values() if d.get('direction') == 'BEAR')
+    total      = len(WATCHLIST)
+    if bull_count >= BREADTH_BULL_THRESH:
+        breadth = "BULL_DOMINANT"
+        trend   = "falling"   # most tickers bull ≈ VIX falling
+    elif bear_count >= BREADTH_BEAR_THRESH:
+        breadth = "BEAR_DOMINANT"
+        trend   = "rising"    # most tickers bear ≈ VIX rising
+    else:
+        breadth = "MIXED"
+        trend   = None
+    pct = round((bull_count - bear_count) / total * 100, 1)
+    vix_data.update({
+        "trend":       trend,
+        "pct_chg":     pct,
+        "bull_count":  bull_count,
+        "bear_count":  bear_count,
+        "breadth":     breadth,
+        "last_update": datetime.now().strftime("%H:%M:%S"),
+    })
+    print(f"Breadth: {bull_count}B/{bear_count}b/{total} → {breadth}", flush=True)
+
+
 async def scan_ticker(client, ticker, market_open):
     print(f"Scanning {ticker}...", flush=True)
 
@@ -742,6 +797,27 @@ async def scan_ticker(client, ticker, market_open):
     df_5m = resample_to_5m(df_1m)
     if len(df_5m) < 20:
         df_5m = df_1m
+
+    # ── Pre-market gap: compare today's pre-market bars to yesterday RTH close ─
+    pm_gap_pct = None
+    try:
+        if len(df_1m) >= 2:
+            _last_rth_day  = df_1m['date'].iloc[-1]
+            _prev_rth      = df_1m[df_1m['date'] < _last_rth_day]
+            ts_et          = pd.to_datetime(df_raw['ts'], unit='ms', utc=True).dt.tz_convert('America/New_York')
+            _pm_mask       = (
+                ts_et.dt.date == _last_rth_day
+            ) & (
+                (ts_et.dt.hour < 9) | ((ts_et.dt.hour == 9) & (ts_et.dt.minute < 30))
+            )
+            _pm_bars = df_raw[_pm_mask]
+            if len(_pm_bars) > 0 and len(_prev_rth) > 0:
+                pm_close   = float(_pm_bars['Close'].iloc[-1])
+                prev_close = float(_prev_rth['Close'].iloc[-1])
+                if prev_close > 0 and pd.notna(pm_close) and pd.notna(prev_close):
+                    pm_gap_pct = round((pm_close - prev_close) / prev_close * 100, 3)
+    except Exception:
+        pass
 
     result    = compute_signals(df_1m, df_5m)
     price     = result['price']
@@ -785,6 +861,7 @@ async def scan_ticker(client, ticker, market_open):
         "pos_size":     result['pos_size'],
         "gap_pct":      result['gap_pct'],
         "gap_dir":      result['gap_dir'],
+        "pm_gap_pct":   pm_gap_pct,
         "orb_high":     result['orb_high'],
         "orb_low":      result['orb_low'],
         "bull_signals": result['bull_signals'],
@@ -853,6 +930,8 @@ async def main():
                     print(f"Error scanning {ticker}:", flush=True)
                     traceback.print_exc()
                 await asyncio.sleep(1)
+            # Compute breadth from this cycle's results (no extra API call)
+            update_market_breadth()
         except Exception:
             traceback.print_exc()
 
@@ -939,6 +1018,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     <span class="live-dot" id="live-dot"></span>
     <h1>SPX Confluence Scanner</h1>
     <span id="mkt-badge" class="sb sb-starting ms-1">STARTING</span>
+    <span id="vix-badge" class="ctx-badge ctx-neutral" title="VIXY (VIX proxy) — falling=bullish, rising=bearish">VIX --</span>
     <span class="ms-auto text-muted" style="font-size:.72rem">Updated: <span id="last-update">--</span></span>
     <button class="sound-btn on" id="sound-btn" onclick="toggleSound()">🔔 Sound ON</button>
   </div>
@@ -987,10 +1067,14 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     </div>
     <div class="col-md-3">
       <div class="card p-3 h-100">
-        <div class="section-title">TradingView</div>
+        <div class="section-title">TradingView — <span id="tv-label">SPY</span></div>
         <iframe id="tv-frame"
           src="https://www.tradingview.com/widgetembed/?symbol=AMEX:SPY&interval=1&theme=dark"
-          width="100%" height="220" frameborder="0"></iframe>
+          width="100%" height="160" frameborder="0"></iframe>
+        <div class="section-title mt-2">VIX (CBOE)</div>
+        <iframe
+          src="https://www.tradingview.com/widgetembed/?symbol=TVC:VIX&interval=D&theme=dark"
+          width="100%" height="50" frameborder="0" style="border-radius:4px"></iframe>
       </div>
     </div>
   </div>
@@ -1017,6 +1101,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 <script>
 let allData    = {};
 let signalLog  = [];
+let vixData    = null;
 let curTicker  = 'SPY';
 let curDir     = 'bull';
 let soundOn    = true;
@@ -1111,6 +1196,7 @@ function selectTicker(t) {
   updateChart();
   document.getElementById('detail-title').textContent = t + ' — Signals';
   document.getElementById('chart-ticker').textContent = t;
+  document.getElementById('tv-label').textContent = t;
   document.getElementById('tv-frame').src =
     `https://www.tradingview.com/widgetembed/?symbol=${TV_SYMBOLS[t]||'AMEX:SPY'}&interval=1&theme=dark`;
 }
@@ -1124,17 +1210,26 @@ function setDir(dir) {
   renderRiskPanel();
 }
 
-// ── Context row (Gap + ORB) ────────────────────────────────────────────────────
+// ── Context row (Gap + ORB + Pre-market Gap) ─────────────────────────────────
 function renderContextRow() {
   const d = allData[curTicker];
   if (!d) return;
   const row = document.getElementById('ctx-row');
   let html = '';
 
+  // Pre-market gap (shown before/at open)
+  if (d.pm_gap_pct != null) {
+    const pmCls = d.pm_gap_pct > 0 ? 'ctx-bull' : d.pm_gap_pct < 0 ? 'ctx-bear' : 'ctx-neutral';
+    html += `<span class="ctx-badge ${pmCls}" title="Pre-market gap vs yesterday RTH close">PM Gap ${d.pm_gap_pct>0?'+':''}${d.pm_gap_pct.toFixed(2)}%</span>`;
+  }
+
+  // Regular session gap
   if (d.gap_pct != null) {
     const cls = d.gap_pct > 0 ? 'ctx-bull' : d.gap_pct < 0 ? 'ctx-bear' : 'ctx-neutral';
-    html += `<span class="ctx-badge ${cls}">Gap ${d.gap_pct>0?'+':''}${d.gap_pct.toFixed(2)}%</span>`;
+    html += `<span class="ctx-badge ${cls}" title="RTH gap vs prior day RTH close">Gap ${d.gap_pct>0?'+':''}${d.gap_pct.toFixed(2)}%</span>`;
   }
+
+  // ORB
   if (d.orb_high != null) {
     html += `<span class="ctx-badge ctx-neutral">ORB H: $${d.orb_high.toFixed(2)}</span>`;
     html += `<span class="ctx-badge ctx-neutral">ORB L: $${d.orb_low.toFixed(2)}</span>`;
@@ -1145,6 +1240,7 @@ function renderContextRow() {
     else
       html += `<span class="ctx-badge ctx-neutral">Inside ORB</span>`;
   }
+
   row.innerHTML = html;
 }
 
@@ -1291,8 +1387,9 @@ async function update() {
   try {
     const res  = await fetch('/api/status');
     const data = await res.json();
-    allData   = data.tickers   || {};
-    signalLog = data.signal_log || [];
+    allData   = data.tickers    || {};
+    signalLog = data.signal_log  || [];
+    vixData   = data.vix         || null;
 
     const mktBadge = document.getElementById('mkt-badge');
     if (data.market_open) {
@@ -1301,6 +1398,22 @@ async function update() {
     } else {
       mktBadge.className = 'sb sb-closed'; mktBadge.textContent = 'MARKET CLOSED';
       document.getElementById('live-dot').className = 'live-dot off';
+    }
+
+    // Breadth/VIX badge
+    const vixBadge = document.getElementById('vix-badge');
+    if (vixData && vixData.breadth && vixData.breadth !== 'NEUTRAL') {
+      const isBull = vixData.breadth === 'BULL_DOMINANT';
+      const cls    = isBull ? 'ctx-bull' : vixData.breadth === 'BEAR_DOMINANT' ? 'ctx-bear' : 'ctx-neutral';
+      const arr    = isBull ? '↑' : '↓';
+      vixBadge.className   = `ctx-badge ${cls}`;
+      vixBadge.textContent = `Breadth ${vixData.bull_count}B/${vixData.bear_count}b ${arr}`;
+      vixBadge.title       = `Market breadth: ${vixData.breadth}`;
+    } else {
+      vixBadge.className   = 'ctx-badge ctx-neutral';
+      vixBadge.textContent = vixData && vixData.bull_count != null
+        ? `Breadth ${vixData.bull_count}B/${vixData.bear_count}b`
+        : 'Breadth --';
     }
 
     let latestUpdate = '--';
