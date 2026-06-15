@@ -1,0 +1,7 @@
+.env
+__pycache__/
+*.pyc
+*.pyo
+22
+0.6
+docker-compose
