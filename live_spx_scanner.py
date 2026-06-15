@@ -1,27 +1,72 @@
 import asyncio
+import itertools
+import json
+import math
+import os
+import threading
 import traceback
+from datetime import datetime, timedelta, timezone
+
 import pandas as pd
 import pandas_ta as ta
 import requests
-from datetime import datetime, timedelta, timezone
-from polygon import RESTClient
 from flask import Flask, jsonify
-import threading
-import os
-import itertools
+from polygon import RESTClient
 
+# ====================== CONFIG ======================
 POLYGON_API_KEY = os.getenv("POLYGON_API_KEY")
 DISCORD_WEBHOOK = os.getenv("DISCORD_WEBHOOK")
+HISTORY_FILE = "/tmp/score_history.json"
+MAX_SCORE = 11
 
-print("=== FULL SPX CONFLUENCE SCANNER STARTING ===")
+print("=== FULL SPX CONFLUENCE SCANNER STARTING ===", flush=True)
 
+# ====================== HELPERS ======================
+
+def _valid(v):
+    try:
+        return v is not None and not math.isnan(float(v))
+    except (TypeError, ValueError):
+        return False
+
+
+def is_market_open():
+    now = datetime.now(timezone.utc)
+    if now.weekday() >= 5:
+        return False
+    # NYSE: 9:30-16:00 ET. EDT=UTC-4 (Mar-Nov), EST=UTC-5 (Nov-Mar)
+    utc_offset = 4 if 3 <= now.month <= 11 else 5
+    market_open  = now.replace(hour=9  + utc_offset, minute=30, second=0, microsecond=0)
+    market_close = now.replace(hour=16 + utc_offset, minute=0,  second=0, microsecond=0)
+    return market_open <= now <= market_close
+
+
+def load_history():
+    try:
+        with open(HISTORY_FILE) as f:
+            return json.load(f)
+    except Exception:
+        return []
+
+
+def save_history(history):
+    try:
+        with open(HISTORY_FILE, "w") as f:
+            json.dump(history, f)
+    except Exception:
+        pass
+
+
+# ====================== STATE ======================
 app = Flask(__name__)
 
 dashboard_data = {
-    "price": 0.0,
-    "score": 0,
-    "status": "STARTING",
+    "price":       0.0,
+    "score":       0,
+    "max_score":   MAX_SCORE,
+    "status":      "STARTING",
     "last_update": "N/A",
+    "market_open": False,
     "signals": {
         "sma20":       {"value": "--", "active": False, "label": "Above SMA20",  "points": 2},
         "adx":         {"value": "--", "active": False, "label": "ADX > 22",     "points": 1},
@@ -33,37 +78,39 @@ dashboard_data = {
         "fvg":         {"value": "--", "active": False, "label": "FVG Active",   "points": 1},
         "ob":          {"value": "--", "active": False, "label": "Order Block",  "points": 1},
     },
-    "history": [],
-    "alerts": []
+    "history": load_history(),
+    "alerts":  [],
 }
 
+# ====================== DISCORD ======================
 
 def send_discord_alert(price, score, message="Strong Signal"):
     if not DISCORD_WEBHOOK:
-        print("Discord webhook not configured")
+        print("Discord webhook not configured", flush=True)
         return
     try:
         payload = {
             "content": (
                 f"🚨 **SPY Scanner Alert** 🚨\n"
                 f"**Price:** {price:.2f}\n"
-                f"**Score:** {score}/10\n"
+                f"**Score:** {score}/{MAX_SCORE}\n"
                 f"**Signal:** {message}\n"
                 f"**Time:** {datetime.now().strftime('%H:%M:%S')}"
             )
         }
         requests.post(DISCORD_WEBHOOK, json=payload, timeout=5)
         dashboard_data["alerts"].insert(0, {
-            "time": datetime.now().strftime("%H:%M:%S"),
-            "price": round(float(price), 2),
-            "score": score,
-            "message": message
+            "time":    datetime.now().strftime("%H:%M:%S"),
+            "price":   round(float(price), 2),
+            "score":   score,
+            "message": message,
         })
         dashboard_data["alerts"] = dashboard_data["alerts"][:10]
-        print("✅ Discord alert sent")
+        print("✅ Discord alert sent", flush=True)
     except Exception as e:
-        print(f"Discord failed: {e}")
+        print(f"Discord failed: {e}", flush=True)
 
+# ====================== DASHBOARD HTML ======================
 
 DASHBOARD_HTML = """<!DOCTYPE html>
 <html lang="en">
@@ -88,23 +135,27 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         .signal-icon { font-size: 1rem; float: right; }
         .alert-item { background: #0d0d0d; border-left: 3px solid #ff9900; padding: 8px 12px; margin-bottom: 6px; border-radius: 0 6px 6px 0; font-size: 0.82rem; }
         .status-badge { font-size: 0.95rem; padding: 5px 14px; border-radius: 20px; font-weight: bold; }
-        .status-normal { background: #00ff8822; color: #00ff88; border: 1px solid #00ff88; }
-        .status-risk { background: #ff444422; color: #ff4444; border: 1px solid #ff4444; }
+        .status-normal   { background: #00ff8822; color: #00ff88; border: 1px solid #00ff88; }
+        .status-risk     { background: #ff444422; color: #ff4444; border: 1px solid #ff4444; }
+        .status-closed   { background: #44444422; color: #888;    border: 1px solid #555; }
         .status-starting { background: #ffaa0022; color: #ffaa00; border: 1px solid #ffaa00; }
         .section-title { color: #666; font-size: 0.7rem; text-transform: uppercase; letter-spacing: 2px; margin-bottom: 10px; }
         .live-dot { display: inline-block; width: 8px; height: 8px; background: #00ff88; border-radius: 50%; margin-right: 8px; animation: pulse 2s infinite; }
+        .live-dot.closed { background: #555; animation: none; }
         @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:0.3} }
         h1 { color: #00ffcc; font-size: 1.5rem; margin: 0; }
         .chart-wrap { background: #111; border: 1px solid #222; border-radius: 10px; padding: 16px; }
+        .market-closed-banner { background: #1a1a1a; border: 1px solid #444; border-radius: 8px; padding: 6px 14px; font-size: 0.8rem; color: #888; }
     </style>
 </head>
 <body class="p-3">
 <div class="container-fluid">
 
-    <div class="d-flex align-items-center mb-3 gap-3">
-        <span class="live-dot"></span>
+    <div class="d-flex align-items-center mb-3 gap-3 flex-wrap">
+        <span class="live-dot" id="live-dot"></span>
         <h1>SPY Confluence Scanner</h1>
         <span id="status-badge" class="status-badge status-starting ms-1">STARTING</span>
+        <span id="market-banner" class="market-closed-banner d-none">Market Closed — showing last session data</span>
         <span class="ms-auto text-muted" style="font-size:0.8rem;">Updated: <span id="last_update">--</span></span>
     </div>
 
@@ -120,7 +171,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
                 <div class="section-title">Confluence Score</div>
                 <div class="d-flex align-items-baseline gap-1">
                     <div class="score-value" id="score-val">--</div>
-                    <div class="text-muted" style="font-size:1.1rem;">/10</div>
+                    <div class="text-muted" id="score-max" style="font-size:1.1rem;">/11</div>
                 </div>
                 <div class="score-bar-wrap">
                     <div class="score-bar" id="score-bar" style="width:0%"></div>
@@ -190,16 +241,17 @@ const scoreChart = new Chart(ctx, {
         animation: { duration: 300 },
         scales: {
             x: { ticks: { color: '#555', maxTicksLimit: 8, font: {size:10} }, grid: { color: '#1a1a1a' } },
-            y: { min: 0, max: 10, ticks: { color: '#555', stepSize: 2 }, grid: { color: '#1a1a1a' } }
+            y: { min: 0, max: 11, ticks: { color: '#555', stepSize: 1 }, grid: { color: '#1a1a1a' } }
         },
         plugins: { legend: { display: false } }
     }
 });
 
-function scoreColor(s) {
-    if (s >= 8) return '#00ff88';
-    if (s >= 6) return '#aaff00';
-    if (s >= 4) return '#ffaa00';
+function scoreColor(s, max) {
+    const pct = s / max;
+    if (pct >= 0.82) return '#00ff88';
+    if (pct >= 0.64) return '#aaff00';
+    if (pct >= 0.45) return '#ffaa00';
     return '#ff4444';
 }
 
@@ -212,7 +264,7 @@ function updateSignals(signals) {
         col.innerHTML =
             '<div class="signal-card ' + (sig.active ? 'active' : 'inactive') + '">' +
             '<span class="signal-icon">' + (sig.active ? '✅' : '❌') + '</span>' +
-            '<div class="signal-label">' + sig.label + '</div>' +
+            '<div class="signal-label">' + sig.label + (sig.points > 1 ? ' (' + sig.points + 'pt)' : '') + '</div>' +
             '<div class="signal-value" style="color:' + (sig.active ? '#00ff88' : '#666') + '">' + sig.value + '</div>' +
             '</div>';
         grid.appendChild(col);
@@ -240,22 +292,46 @@ async function updateDashboard() {
         const res = await fetch('/api/status');
         const data = await res.json();
 
+        const maxScore = data.max_score || 11;
+        document.getElementById('score-max').textContent = '/' + maxScore;
+
         document.getElementById('price').textContent = parseFloat(data.price).toFixed(2);
 
         const score = data.score;
-        const color = scoreColor(score);
+        const color = scoreColor(score, maxScore);
         const scoreEl = document.getElementById('score-val');
         scoreEl.textContent = score;
         scoreEl.style.color = color;
-        document.getElementById('score-bar').style.width = Math.min(score / 10 * 100, 100) + '%';
+        document.getElementById('score-bar').style.width = Math.min(score / maxScore * 100, 100) + '%';
         document.getElementById('score-bar').style.background = color;
 
         const badge = document.getElementById('status-badge');
         const statusEl = document.getElementById('scanner-status');
+        const dot = document.getElementById('live-dot');
+        const banner = document.getElementById('market-banner');
+
         badge.className = 'status-badge';
-        if (data.status === 'NORMAL') { badge.classList.add('status-normal'); statusEl.style.color = '#00ff88'; }
-        else if (data.status === 'REDUCED_RISK') { badge.classList.add('status-risk'); statusEl.style.color = '#ff4444'; }
-        else { badge.classList.add('status-starting'); statusEl.style.color = '#ffaa00'; }
+        if (data.status === 'NORMAL') {
+            badge.classList.add('status-normal');
+            statusEl.style.color = '#00ff88';
+            dot.className = 'live-dot';
+            banner.classList.add('d-none');
+        } else if (data.status === 'REDUCED_RISK') {
+            badge.classList.add('status-risk');
+            statusEl.style.color = '#ff4444';
+            dot.className = 'live-dot';
+            banner.classList.add('d-none');
+        } else if (data.status === 'MARKET_CLOSED') {
+            badge.classList.add('status-closed');
+            statusEl.style.color = '#888';
+            dot.className = 'live-dot closed';
+            banner.classList.remove('d-none');
+        } else {
+            badge.classList.add('status-starting');
+            statusEl.style.color = '#ffaa00';
+            dot.className = 'live-dot';
+            banner.classList.add('d-none');
+        }
         badge.textContent = data.status;
         statusEl.textContent = data.status;
 
@@ -268,6 +344,7 @@ async function updateDashboard() {
             scoreChart.data.labels = data.history.map(function(h){ return h.time; });
             scoreChart.data.datasets[0].data = data.history.map(function(h){ return h.score; });
             scoreChart.data.datasets[0].borderColor = color;
+            scoreChart.options.scales.y.max = maxScore;
             scoreChart.update();
         }
     } catch(e) {
@@ -281,6 +358,7 @@ updateDashboard();
 </body>
 </html>"""
 
+# ====================== ROUTES ======================
 
 @app.route('/')
 def dashboard():
@@ -292,12 +370,24 @@ def api_status():
     return jsonify(dashboard_data)
 
 
+@app.route('/api/signal')
+def api_signal():
+    try:
+        with open('/tmp/axi_signal.json') as f:
+            return jsonify(json.load(f))
+    except FileNotFoundError:
+        return jsonify({"status": "no signal yet"})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
 @app.route('/health')
 def health():
     return jsonify({
         "status": "healthy",
         "scanner_running": True,
-        "time": datetime.now().strftime("%H:%M:%S")
+        "market_open": dashboard_data.get("market_open", False),
+        "time": datetime.now().strftime("%H:%M:%S"),
     })
 
 
@@ -311,12 +401,14 @@ def test_alert():
     return jsonify({"status": "success", "message": "Discord alert sent"})
 
 
+# ====================== SMC HELPERS ======================
+
 def detect_fvg(df):
     try:
         bullish = (df['Low'].shift(-1) > df['High'].shift(2)).iloc[-1]
         bearish = (df['High'].shift(-1) < df['Low'].shift(2)).iloc[-1]
-        return bullish or bearish
-    except:
+        return bool(bullish or bearish)
+    except Exception:
         return False
 
 
@@ -324,27 +416,35 @@ def detect_order_blocks(df):
     try:
         ob_bull = (df['Low'].rolling(10).min() == df['Low']).iloc[-1]
         ob_bear = (df['High'].rolling(10).max() == df['High']).iloc[-1]
-        return ob_bull or ob_bear
-    except:
+        return bool(ob_bull or ob_bear)
+    except Exception:
         return False
 
 
+# ====================== MAIN SCANNER ======================
+
 async def main():
-    print("MAIN FUNCTION STARTED")
+    print("MAIN FUNCTION STARTED", flush=True)
     if not POLYGON_API_KEY:
-        print("ERROR: POLYGON_API_KEY not set")
+        print("ERROR: POLYGON_API_KEY not set", flush=True)
         return
 
     client = RESTClient(POLYGON_API_KEY)
-    print("Polygon client initialized")
-    print("✅ Scanner Engine Running")
+    print("Polygon client initialized", flush=True)
+    print("✅ Scanner Engine Running", flush=True)
 
     while True:
-        print("SCANNER LOOP RUNNING")
+        print("SCANNER LOOP RUNNING", flush=True)
         try:
-            print("Fetching market data...")
+            market_open = is_market_open()
+            dashboard_data["market_open"] = market_open
 
-            end = datetime.now(timezone.utc)
+            print(
+                f"Fetching market data... (market {'OPEN' if market_open else 'CLOSED'})",
+                flush=True
+            )
+
+            end   = datetime.now(timezone.utc)
             start = end - timedelta(days=5)
 
             aggs = list(itertools.islice(client.get_aggs(
@@ -356,57 +456,70 @@ async def main():
                 limit=500
             ), 500))
 
-            print(f"Fetched candles: {len(aggs)}")
+            print(f"Fetched candles: {len(aggs)}", flush=True)
 
             if len(aggs) < 50:
-                print("⚠️ Not enough candle data")
-                await asyncio.sleep(30)
+                print("⚠️ Not enough candle data", flush=True)
+                dashboard_data["status"] = "MARKET_CLOSED" if not market_open else "NO_DATA"
+                await asyncio.sleep(300 if not market_open else 30)
                 continue
 
+            # Build dataframe with timestamps
             df = pd.DataFrame([{
-                'Open': a.open,
-                'High': a.high,
-                'Low': a.low,
-                'Close': a.close,
-                'Volume': a.volume
+                'Open':   a.open,
+                'High':   a.high,
+                'Low':    a.low,
+                'Close':  a.close,
+                'Volume': a.volume,
+                'ts':     a.timestamp,
             } for a in aggs])
 
+            df['date'] = pd.to_datetime(df['ts'], unit='ms', utc=True).dt.date
+
+            # Indicators on full dataset
             df['sma20'] = ta.sma(df['Close'], length=20)
-            df['rsi'] = ta.rsi(df['Close'], length=14)
+            df['rsi']   = ta.rsi(df['Close'], length=14)
 
-            adx = ta.adx(df['High'], df['Low'], df['Close'], length=14)
-            df['adx'] = adx['ADX_14']
+            adx_df = ta.adx(df['High'], df['Low'], df['Close'], length=14)
+            df['adx'] = adx_df['ADX_14']
 
-            supertrend = ta.supertrend(df['High'], df['Low'], df['Close'], length=7, multiplier=1.0)
-            df['supertrend'] = supertrend.iloc[:, 0]
+            st_df = ta.supertrend(df['High'], df['Low'], df['Close'], length=7, multiplier=1.0)
+            df['supertrend'] = st_df.iloc[:, 0]
 
-            ha_close = (df['Open'] + df['High'] + df['Low'] + df['Close']) / 4
-            ha_open = ha_close.shift(1)
-            ha_bull = ha_close.iloc[-1] > ha_open.iloc[-1]
-
-            df['vwap'] = ta.vwap(df['High'], df['Low'], df['Close'], df['Volume'])
+            # VWAP on last trading day only (resets each session)
+            last_day = df['date'].iloc[-1]
+            day_df   = df[df['date'] == last_day].copy().reset_index(drop=True)
+            if len(day_df) >= 5:
+                day_df.index = pd.to_datetime(
+                    day_df['ts'], unit='ms', utc=True
+                ).dt.tz_convert('America/New_York')
+                vwap_series = ta.vwap(day_df['High'], day_df['Low'], day_df['Close'], day_df['Volume'])
+                vwap_val = vwap_series.iloc[-1] if (vwap_series is not None and len(vwap_series) > 0) else None
+            else:
+                vwap_val = None
 
             df = df.bfill()
 
+            # Heikin Ashi
+            ha_close = (df['Open'] + df['High'] + df['Low'] + df['Close']) / 4
+            ha_open  = ha_close.shift(1)
+            ha_bull  = bool(ha_close.iloc[-1] > ha_open.iloc[-1])
+
+            # FTFC
             ftfc = (df['Close'] > df['Open']).rolling(30).mean().iloc[-1]
+
+            # SMC
             fvg_active = detect_fvg(df)
-            ob_active = detect_order_blocks(df)
+            ob_active  = detect_order_blocks(df)
 
+            # Extract latest values
             current_price = df['Close'].iloc[-1]
-            sma20_val    = df['sma20'].iloc[-1]
-            adx_val      = df['adx'].iloc[-1]
-            rsi_val      = df['rsi'].iloc[-1]
-            vwap_val     = df['vwap'].iloc[-1]
-            st_val       = df['supertrend'].iloc[-1]
+            sma20_val     = df['sma20'].iloc[-1]
+            adx_val       = df['adx'].iloc[-1]
+            rsi_val       = df['rsi'].iloc[-1]
+            st_val        = df['supertrend'].iloc[-1]
 
-            import math
-
-            def _valid(v):
-                try:
-                    return v is not None and not math.isnan(float(v))
-                except (TypeError, ValueError):
-                    return False
-
+            # Signal conditions
             sma20_active = _valid(sma20_val) and current_price > sma20_val
             adx_active   = _valid(adx_val)   and adx_val > 22
             rsi_active   = _valid(rsi_val)   and 45 < rsi_val < 65
@@ -414,6 +527,7 @@ async def main():
             st_active    = _valid(st_val)    and current_price > st_val
             vwap_active  = _valid(vwap_val)  and current_price > vwap_val
 
+            # Score (max 11)
             score  = 0
             score += 2 if sma20_active else 0
             score += 1 if adx_active   else 0
@@ -425,54 +539,65 @@ async def main():
             score += 1 if fvg_active   else 0
             score += 1 if ob_active    else 0
 
-            gov_status = "NORMAL" if score >= 7 else "REDUCED_RISK"
+            if not market_open:
+                gov_status = "MARKET_CLOSED"
+            elif score >= 8:
+                gov_status = "NORMAL"
+            else:
+                gov_status = "REDUCED_RISK"
 
             signals = {
-                "sma20":       {"value": f"{sma20_val:.2f}" if _valid(sma20_val) else "--",             "active": bool(sma20_active), "label": "Above SMA20",  "points": 2},
-                "adx":         {"value": f"{adx_val:.1f}" if _valid(adx_val) else "--",               "active": bool(adx_active),   "label": "ADX > 22",     "points": 1},
-                "rsi":         {"value": f"{rsi_val:.1f}" if _valid(rsi_val) else "--",               "active": bool(rsi_active),   "label": "RSI 45-65",    "points": 1},
-                "ftfc":        {"value": f"{ftfc * 100:.0f}%" if _valid(ftfc) else "--",           "active": bool(ftfc_active),  "label": "FTFC > 60%",   "points": 2},
-                "supertrend":  {"value": f"{st_val:.2f}" if _valid(st_val) else "--",                "active": bool(st_active),    "label": "SuperTrend",   "points": 1},
-                "heikin_ashi": {"value": "Bull" if ha_bull else "Bear",  "active": bool(ha_bull),      "label": "Heikin Ashi",  "points": 1},
-                "vwap":        {"value": f"{vwap_val:.2f}" if _valid(vwap_val) else "--",              "active": bool(vwap_active),  "label": "Above VWAP",   "points": 1},
-                "fvg":         {"value": "Active" if fvg_active else "None", "active": bool(fvg_active), "label": "FVG Active", "points": 1},
-                "ob":          {"value": "Active" if ob_active  else "None", "active": bool(ob_active),  "label": "Order Block","points": 1},
+                "sma20":       {"value": f"{sma20_val:.2f}" if _valid(sma20_val) else "--", "active": bool(sma20_active), "label": "Above SMA20",  "points": 2},
+                "adx":         {"value": f"{adx_val:.1f}"   if _valid(adx_val)   else "--", "active": bool(adx_active),   "label": "ADX > 22",     "points": 1},
+                "rsi":         {"value": f"{rsi_val:.1f}"   if _valid(rsi_val)   else "--", "active": bool(rsi_active),   "label": "RSI 45-65",    "points": 1},
+                "ftfc":        {"value": f"{ftfc*100:.0f}%" if _valid(ftfc)      else "--", "active": bool(ftfc_active),  "label": "FTFC > 60%",   "points": 2},
+                "supertrend":  {"value": f"{st_val:.2f}"    if _valid(st_val)    else "--", "active": bool(st_active),    "label": "SuperTrend",   "points": 1},
+                "heikin_ashi": {"value": "Bull" if ha_bull else "Bear",                     "active": bool(ha_bull),      "label": "Heikin Ashi",  "points": 1},
+                "vwap":        {"value": f"{vwap_val:.2f}"  if _valid(vwap_val)  else "--", "active": bool(vwap_active),  "label": "Above VWAP",   "points": 1},
+                "fvg":         {"value": "Active" if fvg_active else "None",                "active": bool(fvg_active),   "label": "FVG Active",   "points": 1},
+                "ob":          {"value": "Active" if ob_active  else "None",                "active": bool(ob_active),    "label": "Order Block",  "points": 1},
             }
 
             history = dashboard_data["history"]
             history.append({"time": datetime.now().strftime("%H:%M"), "score": int(score)})
             if len(history) > 60:
                 history.pop(0)
+            save_history(history)
 
             dashboard_data.update({
                 "price":       round(float(current_price), 2),
                 "score":       int(score),
                 "status":      gov_status,
                 "last_update": datetime.now().strftime("%H:%M:%S"),
+                "market_open": market_open,
                 "signals":     signals,
                 "history":     history,
             })
 
-            if score >= 8:
+            if market_open and score >= 9:
                 send_discord_alert(current_price, score, "🔥 HIGH CONFLUENCE SETUP")
 
             print(
                 f"[{datetime.now().strftime('%H:%M:%S')}] "
-                f"SPY {current_price:.2f} | Score: {score}/10 | {gov_status}"
+                f"SPY {current_price:.2f} | Score: {score}/{MAX_SCORE} | {gov_status}",
+                flush=True
             )
 
-            await asyncio.sleep(45)
+            # Poll less often when market is closed
+            await asyncio.sleep(300 if not market_open else 45)
 
         except Exception:
-            print("========== SCANNER ERROR ==========")
+            print("========== SCANNER ERROR ==========", flush=True)
             traceback.print_exc()
             await asyncio.sleep(15)
 
 
-if __name__ == "__main__":
-    threading.Thread(
-        target=lambda: asyncio.run(main()),
-        daemon=True
-    ).start()
+# ====================== START ======================
+# Start scanner thread at module level so gunicorn picks it up
+threading.Thread(
+    target=lambda: asyncio.run(main()),
+    daemon=True
+).start()
 
+if __name__ == "__main__":
     app.run(host='0.0.0.0', port=8080, debug=False)
