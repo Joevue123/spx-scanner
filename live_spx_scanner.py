@@ -1,4 +1,5 @@
 import asyncio
+import csv
 import itertools
 import json
 import math
@@ -26,14 +27,19 @@ EMAIL_TO          = os.getenv("EMAIL_TO")
 SMTP_HOST         = os.getenv("SMTP_HOST", "smtp.gmail.com")
 SMTP_PORT         = int(os.getenv("SMTP_PORT", "587"))
 
-WATCHLIST             = ["SPY", "QQQ", "IWM"]
+WATCHLIST             = ["SPY", "QQQ", "IWM", "NVDA", "AAPL"]
 SIGNAL_LOG_FILE       = "/tmp/signal_log.json"
+CSV_LOG_FILE          = "/tmp/signals.csv"
 HISTORY_FILE_TMPL     = "/tmp/score_history_{}.json"
-MAX_SCORE             = 12       # max points per direction
-ALERT_COOLDOWN_SECS   = 900      # 15 min between alerts per ticker
-VOLUME_SPIKE_MULT     = 3.0      # x avg volume to trigger spike alert
-ALERT_SCORE_THRESHOLD = 9        # send external notifications at this score
-LOG_SCORE_THRESHOLD   = 6        # write to signal log at this score
+MAX_SCORE             = 16       # 12 existing + BB(1) + MACD(1) + ORB(1) + Gap(1)
+ALERT_COOLDOWN_SECS   = 900
+VOLUME_SPIKE_MULT     = 3.0
+ALERT_SCORE_THRESHOLD = 9
+LOG_SCORE_THRESHOLD   = 6
+ATR_STOP_MULT         = 1.5      # stop loss = price ± 1.5×ATR
+ATR_TP_MULT           = 2.5      # take profit = price ± 2.5×ATR
+ACCOUNT_SIZE          = float(os.getenv("ACCOUNT_SIZE", "25000"))
+RISK_PCT              = 0.01     # risk 1% of account per trade
 
 print("=== SPX CONFLUENCE SCANNER STARTING ===", flush=True)
 
@@ -158,6 +164,19 @@ def save_signal_log(log):
         pass
 
 
+def log_to_csv(row: dict):
+    """Append a signal row to the CSV log file."""
+    try:
+        file_exists = os.path.isfile(CSV_LOG_FILE)
+        with open(CSV_LOG_FILE, "a", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=list(row.keys()))
+            if not file_exists:
+                writer.writeheader()
+            writer.writerow(row)
+    except Exception:
+        pass
+
+
 # ====================== INDICATORS ======================
 
 def _calc_ha_bull(df):
@@ -199,26 +218,21 @@ def detect_order_blocks(df):
 
 
 def detect_rsi_divergence(df):
-    """
-    Regular RSI divergence on last 30 bars.
-    Bull: price lower low, RSI higher low.
-    Bear: price higher high, RSI lower high.
-    Returns 'bull', 'bear', or None.
-    """
+    """Bull: price lower low + RSI higher low. Bear: inverse. Returns 'bull','bear',None."""
     try:
         if len(df) < 30 or 'rsi' not in df.columns:
             return None
-        prices    = df['Close'].values[-30:]
-        rsi_vals  = df['rsi'].values[-30:]
+        prices   = df['Close'].values[-30:]
+        rsi_vals = df['rsi'].values[-30:]
         half = 15
-        prior_p, recent_p = prices[:half],    prices[half:]
-        prior_r, recent_r = rsi_vals[:half],  rsi_vals[half:]
+        prior_p, recent_p = prices[:half],   prices[half:]
+        prior_r, recent_r = rsi_vals[:half], rsi_vals[half:]
 
-        pi_low  = prior_p.argmin();  ri_low  = recent_p.argmin()
+        pi_low = prior_p.argmin(); ri_low = recent_p.argmin()
         if recent_p[ri_low] < prior_p[pi_low] and recent_r[ri_low] > prior_r[pi_low]:
             return 'bull'
 
-        pi_high = prior_p.argmax();  ri_high = recent_p.argmax()
+        pi_high = prior_p.argmax(); ri_high = recent_p.argmax()
         if recent_p[ri_high] > prior_p[pi_high] and recent_r[ri_high] < prior_r[pi_high]:
             return 'bear'
 
@@ -229,7 +243,7 @@ def detect_rsi_divergence(df):
 
 # ====================== NOTIFICATIONS ======================
 
-_last_alert_times = {}   # {ticker: datetime}
+_last_alert_times = {}
 
 
 def _send_discord(ticker, message):
@@ -270,9 +284,10 @@ def _send_email(subject, body):
         print(f"Email failed: {e}", flush=True)
 
 
-def send_notifications(ticker, price, bull_score, bear_score, direction, volume_spike=False):
+def send_notifications(ticker, price, bull_score, bear_score, direction,
+                       volume_spike=False, atr=None, stop=None, tp=None):
     global _last_alert_times
-    now = datetime.now()
+    now  = datetime.now()
     last = _last_alert_times.get(ticker)
     if last and (now - last).total_seconds() < ALERT_COOLDOWN_SECS:
         remaining = int(ALERT_COOLDOWN_SECS - (now - last).total_seconds())
@@ -282,9 +297,14 @@ def send_notifications(ticker, price, bull_score, bear_score, direction, volume_
     score = bull_score if direction == "BULL" else bear_score
     arrow = "🔥" if direction == "BULL" else "🔻"
     vol   = " ⚡ VOLUME SPIKE" if volume_spike else ""
-    msg   = (
+    levels = ""
+    if atr and stop and tp:
+        levels = f"\nATR: {atr:.2f} | SL: ${stop:.2f} | TP: ${tp:.2f}"
+
+    msg = (
         f"{arrow} *{ticker} {direction} Confluence Alert*{vol}\n"
-        f"Price: ${price:.2f} | Score: {score}/{MAX_SCORE}\n"
+        f"Price: ${price:.2f} | Score: {score}/{MAX_SCORE}"
+        f"{levels}\n"
         f"Time: {now.strftime('%H:%M:%S ET')}"
     )
 
@@ -310,40 +330,35 @@ def send_notifications(ticker, price, bull_score, bear_score, direction, volume_
 # ====================== STATE ======================
 app = Flask(__name__)
 
-_blank_signals = lambda: {
-    "sma20":       {"value": "--", "active": False, "label": "SMA20 MTF",     "points": 2, "dir": "bull"},
-    "adx":         {"value": "--", "active": False, "label": "ADX",           "points": 1, "dir": "bull"},
-    "rsi":         {"value": "--", "active": False, "label": "RSI",           "points": 1, "dir": "bull"},
-    "ftfc":        {"value": "--", "active": False, "label": "FTFC MTF",      "points": 2, "dir": "bull"},
-    "supertrend":  {"value": "--", "active": False, "label": "SuperTrend MTF","points": 1, "dir": "bull"},
-    "heikin_ashi": {"value": "--", "active": False, "label": "Heikin Ashi MTF","points":1, "dir": "bull"},
-    "vwap":        {"value": "--", "active": False, "label": "VWAP",          "points": 1, "dir": "bull"},
-    "fvg":         {"value": "--", "active": False, "label": "FVG",           "points": 1, "dir": "bull"},
-    "ob":          {"value": "--", "active": False, "label": "Order Block",   "points": 1, "dir": "bull"},
-    "rsi_div":     {"value": "--", "active": False, "label": "RSI Divergence","points": 1, "dir": "bull"},
+_blank_ticker = lambda t: {
+    "price":        0.0,
+    "bull_score":   0,
+    "bear_score":   0,
+    "direction":    "NEUTRAL",
+    "max_score":    MAX_SCORE,
+    "status":       "STARTING",
+    "last_update":  "N/A",
+    "market_open":  False,
+    "volume_spike": False,
+    "vol_ratio":    None,
+    "atr":          None,
+    "bull_stop":    None,
+    "bull_tp":      None,
+    "bear_stop":    None,
+    "bear_tp":      None,
+    "pos_size":     None,
+    "gap_pct":      None,
+    "gap_dir":      None,
+    "orb_high":     None,
+    "orb_low":      None,
+    "bull_signals": {},
+    "bear_signals": {},
+    "history":      load_history(t),
+    "alerts":       [],
 }
 
-dashboard_data = {
-    ticker: {
-        "price":        0.0,
-        "bull_score":   0,
-        "bear_score":   0,
-        "direction":    "NEUTRAL",
-        "max_score":    MAX_SCORE,
-        "status":       "STARTING",
-        "last_update":  "N/A",
-        "market_open":  False,
-        "volume_spike": False,
-        "vol_ratio":    None,
-        "bull_signals": _blank_signals(),
-        "bear_signals": _blank_signals(),
-        "history":      load_history(ticker),
-        "alerts":       [],
-    }
-    for ticker in WATCHLIST
-}
-
-signal_log = load_signal_log()
+dashboard_data = {t: _blank_ticker(t) for t in WATCHLIST}
+signal_log     = load_signal_log()
 
 # ====================== ROUTES ======================
 
@@ -382,22 +397,35 @@ def health():
     return jsonify({
         "status":      "healthy",
         "market_open": is_market_open(),
-        "tickers":     list(dashboard_data.keys()),
+        "watchlist":   WATCHLIST,
         "time":        datetime.now().strftime("%H:%M:%S"),
     })
 
 
 @app.route('/test-alert')
 def test_alert():
-    send_notifications("SPY", 500.0, 10, 2, "BULL", volume_spike=False)
-    return jsonify({"status": "success"})
+    _last_alert_times.pop("SPY", None)
+    d = dashboard_data.get("SPY", {})
+    send_notifications(
+        "SPY", d.get("price", 500.0), 12, 2, "BULL",
+        volume_spike=True,
+        atr=d.get("atr"), stop=d.get("bull_stop"), tp=d.get("bull_tp")
+    )
+    return jsonify({"status": "success", "message": "Test alert sent"})
 
 
 # ====================== SCANNER ======================
 
+def _filter_rth(df):
+    """Keep only regular trading hours bars: 9:30 AM – 4:00 PM ET."""
+    ts_et = pd.to_datetime(df['ts'], unit='ms', utc=True).dt.tz_convert('America/New_York')
+    mask  = (
+        (ts_et.dt.hour > 9) | ((ts_et.dt.hour == 9) & (ts_et.dt.minute >= 30))
+    ) & (ts_et.dt.hour < 16)
+    return df[mask].copy().reset_index(drop=True)
+
 
 def resample_to_5m(df_1m):
-    """Resample 1m OHLCV to 5m using pandas — avoids extra API calls."""
     df = df_1m.copy()
     df['datetime'] = pd.to_datetime(df['ts'], unit='ms', utc=True)
     df = df.set_index('datetime')
@@ -414,7 +442,6 @@ def resample_to_5m(df_1m):
 
 
 def fetch_aggs(client, ticker, multiplier, days, limit=500):
-    """Fetch candles, return a DataFrame or None."""
     try:
         end   = datetime.now(timezone.utc)
         start = end - timedelta(days=days)
@@ -446,23 +473,58 @@ def fetch_aggs(client, ticker, multiplier, days, limit=500):
 
 
 def compute_signals(df_1m, df_5m):
-    """
-    Compute all bull and bear signals on 1m + 5m data.
-    Returns a result dict.
-    """
-    # --- Indicators on 1m ---
+    # ── 1m indicators ──────────────────────────────────────────────────────────
     df = df_1m.copy()
-    df['sma20']  = ta.sma(df['Close'], length=20)
-    df['rsi']    = ta.rsi(df['Close'], length=14)
-    adx_df       = ta.adx(df['High'], df['Low'], df['Close'], length=14)
-    df['adx']    = adx_df.get('ADX_14', adx_df.iloc[:, 0])
-    df['dmp']    = adx_df.get('DMP_14', adx_df.iloc[:, 1])
-    df['dmn']    = adx_df.get('DMN_14', adx_df.iloc[:, 2])
-    st_df        = ta.supertrend(df['High'], df['Low'], df['Close'], length=7, multiplier=1.0)
-    df['st']     = st_df.iloc[:, 0]
+    df['sma20'] = ta.sma(df['Close'], length=20)
+    df['rsi']   = ta.rsi(df['Close'], length=14)
+    adx_df      = ta.adx(df['High'], df['Low'], df['Close'], length=14)
+    df['adx']   = adx_df.get('ADX_14', adx_df.iloc[:, 0])
+    df['dmp']   = adx_df.get('DMP_14', adx_df.iloc[:, 1])
+    df['dmn']   = adx_df.get('DMN_14', adx_df.iloc[:, 2])
+    st_df       = ta.supertrend(df['High'], df['Low'], df['Close'], length=7, multiplier=1.0)
+    df['st']    = st_df.iloc[:, 0]
     df = df.bfill()
 
-    # --- Indicators on 5m ---
+    # ── NEW: Bollinger Bands ───────────────────────────────────────────────────
+    bb_upper_val = bb_lower_val = bb_squeeze = None
+    try:
+        bb_df = ta.bbands(df['Close'], length=20, std=2.0)
+        if bb_df is not None and len(bb_df.columns) >= 4:
+            bb_lower  = bb_df.iloc[:, 0]   # BBL
+            bb_upper  = bb_df.iloc[:, 2]   # BBU
+            bb_bw     = bb_df.iloc[:, 3]   # BBB (bandwidth %)
+            bb_upper_val = float(bb_upper.iloc[-1]) if _valid(bb_upper.iloc[-1]) else None
+            bb_lower_val = float(bb_lower.iloc[-1]) if _valid(bb_lower.iloc[-1]) else None
+            if len(bb_bw.dropna()) >= 20:
+                bw_now = float(bb_bw.iloc[-1])
+                bw_avg = float(bb_bw.rolling(50).mean().iloc[-1])
+                bb_squeeze = _valid(bw_now) and _valid(bw_avg) and bw_now < bw_avg * 0.85
+    except Exception:
+        pass
+
+    # ── NEW: MACD ─────────────────────────────────────────────────────────────
+    macd_val = signal_val = macd_prev = signal_prev = None
+    try:
+        macd_df = ta.macd(df['Close'], fast=12, slow=26, signal=9)
+        if macd_df is not None and len(macd_df.columns) >= 3:
+            macd_line   = macd_df.iloc[:, 0]
+            signal_line = macd_df.iloc[:, 2]
+            macd_val    = float(macd_line.iloc[-1])   if _valid(macd_line.iloc[-1])   else None
+            signal_val  = float(signal_line.iloc[-1]) if _valid(signal_line.iloc[-1]) else None
+            macd_prev   = float(macd_line.iloc[-2])   if len(macd_line) > 1 and _valid(macd_line.iloc[-2])   else None
+            signal_prev = float(signal_line.iloc[-2]) if len(signal_line) > 1 and _valid(signal_line.iloc[-2]) else None
+    except Exception:
+        pass
+
+    # ── NEW: ATR ──────────────────────────────────────────────────────────────
+    atr_val = None
+    try:
+        atr_s   = ta.atr(df['High'], df['Low'], df['Close'], length=14)
+        atr_val = float(atr_s.iloc[-1]) if (atr_s is not None and _valid(atr_s.iloc[-1])) else None
+    except Exception:
+        pass
+
+    # ── 5m indicators ─────────────────────────────────────────────────────────
     df5 = df_5m.copy()
     df5['sma20'] = ta.sma(df5['Close'], length=20)
     df5['rsi']   = ta.rsi(df5['Close'], length=14)
@@ -470,29 +532,58 @@ def compute_signals(df_1m, df_5m):
     df5['st']    = st5_df.iloc[:, 0]
     df5 = df5.bfill()
 
-    # --- VWAP on today's 1m data ---
-    last_day = df['date'].iloc[-1]
-    day_df   = df[df['date'] == last_day].copy().reset_index(drop=True)
-    vwap_val = None
-    if len(day_df) >= 5:
-        day_df.index = pd.to_datetime(
-            day_df['ts'], unit='ms', utc=True
+    # ── VWAP (today's 1m data) ────────────────────────────────────────────────
+    last_day    = df['date'].iloc[-1]
+    today_df    = df[df['date'] == last_day].copy().reset_index(drop=True)
+    prev_df     = df[df['date'] < last_day]
+    vwap_val    = None
+    if len(today_df) >= 5:
+        today_df.index = pd.to_datetime(
+            today_df['ts'], unit='ms', utc=True
         ).dt.tz_convert('America/New_York')
-        vwap_s = ta.vwap(day_df['High'], day_df['Low'], day_df['Close'], day_df['Volume'])
+        vwap_s = ta.vwap(today_df['High'], today_df['Low'], today_df['Close'], today_df['Volume'])
         if vwap_s is not None and len(vwap_s) > 0:
-            vwap_val = vwap_s.iloc[-1]
+            vwap_val = float(vwap_s.iloc[-1])
 
-    # --- Snapshot values ---
-    price     = df['Close'].iloc[-1]
-    sma20_1m  = df['sma20'].iloc[-1]
-    rsi_1m    = df['rsi'].iloc[-1]
-    adx_val   = df['adx'].iloc[-1]
-    dmp_val   = df['dmp'].iloc[-1]
-    dmn_val   = df['dmn'].iloc[-1]
-    st_1m     = df['st'].iloc[-1]
-    sma20_5m  = df5['sma20'].iloc[-1]
-    st_5m     = df5['st'].iloc[-1]
-    price_5m  = df5['Close'].iloc[-1]
+    # ── NEW: Gap detection ────────────────────────────────────────────────────
+    # Use fresh slices from df (today_df index was mutated for VWAP above)
+    _today_raw = df[df['date'] == last_day]
+    _prev_raw  = df[df['date'] <  last_day]
+    gap_pct = gap_dir = None
+    try:
+        if len(_prev_raw) > 0 and len(_today_raw) >= 1:
+            yclose = _prev_raw['Close'].iloc[-1]
+            topen  = _today_raw['Open'].iloc[0]
+            if pd.notna(yclose) and pd.notna(topen) and float(yclose) > 0:
+                gap_pct = round((float(topen) - float(yclose)) / float(yclose) * 100, 3)
+                if gap_pct >= 0.2:
+                    gap_dir = 'bull'
+                elif gap_pct <= -0.2:
+                    gap_dir = 'bear'
+    except Exception as e:
+        print(f"Gap error: {e}", flush=True)
+
+    # ── NEW: Opening Range Breakout (first 30 min = first 30 1m candles) ─────
+    orb_high = orb_low = orb_dir = None
+    try:
+        if len(_today_raw) >= 30:
+            orb_candles = _today_raw.head(30)
+            orb_high    = round(float(orb_candles['High'].max()), 2)
+            orb_low     = round(float(orb_candles['Low'].min()),  2)
+    except Exception:
+        pass
+
+    # ── Snapshot values ───────────────────────────────────────────────────────
+    price    = float(df['Close'].iloc[-1])
+    sma20_1m = float(df['sma20'].iloc[-1])
+    rsi_1m   = float(df['rsi'].iloc[-1])
+    adx_val  = float(df['adx'].iloc[-1])
+    dmp_val  = float(df['dmp'].iloc[-1])
+    dmn_val  = float(df['dmn'].iloc[-1])
+    st_1m    = float(df['st'].iloc[-1])
+    sma20_5m = float(df5['sma20'].iloc[-1])
+    st_5m    = float(df5['st'].iloc[-1])
+    price_5m = float(df5['Close'].iloc[-1])
 
     ha_bull_1m = _calc_ha_bull(df)
     ha_bull_5m = _calc_ha_bull(df5)
@@ -502,64 +593,106 @@ def compute_signals(df_1m, df_5m):
     ob_dir     = detect_order_blocks(df)
     rsi_div    = detect_rsi_divergence(df)
 
-    vol_avg    = df['Volume'].rolling(20).mean().iloc[-1]
-    vol_cur    = df['Volume'].iloc[-1]
-    vol_spike  = bool(_valid(vol_avg) and vol_avg > 0 and vol_cur > VOLUME_SPIKE_MULT * vol_avg)
-    vol_ratio  = round(vol_cur / vol_avg, 1) if (_valid(vol_avg) and vol_avg > 0) else None
+    vol_avg   = float(df['Volume'].rolling(20).mean().iloc[-1])
+    vol_cur   = float(df['Volume'].iloc[-1])
+    vol_spike = bool(_valid(vol_avg) and vol_avg > 0 and vol_cur > VOLUME_SPIKE_MULT * vol_avg)
+    vol_ratio = round(vol_cur / vol_avg, 1) if (_valid(vol_avg) and vol_avg > 0) else None
 
-    # ---- Bull signals ----
+    # ── ATR risk levels ───────────────────────────────────────────────────────
+    bull_stop = bull_tp = bear_stop = bear_tp = pos_size = None
+    if _valid(atr_val) and atr_val > 0:
+        bull_stop = round(price - ATR_STOP_MULT * atr_val, 2)
+        bull_tp   = round(price + ATR_TP_MULT   * atr_val, 2)
+        bear_stop = round(price + ATR_STOP_MULT * atr_val, 2)
+        bear_tp   = round(price - ATR_TP_MULT   * atr_val, 2)
+        risk_per_trade = ACCOUNT_SIZE * RISK_PCT
+        pos_size = max(1, int(risk_per_trade / (ATR_STOP_MULT * atr_val)))
+
+    # ── ORB direction (needs price) ───────────────────────────────────────────
+    if orb_high is not None and orb_low is not None:
+        if price > orb_high:
+            orb_dir = 'bull'
+        elif price < orb_low:
+            orb_dir = 'bear'
+
+    # ── Signal builder helper ──────────────────────────────────────────────────
     def bs(label, pts, active, value, tf1=None, tf5=None):
         d = {"label": label, "points": pts, "active": bool(active), "value": value}
         if tf1 is not None: d["tf1"] = bool(tf1)
         if tf5 is not None: d["tf5"] = bool(tf5)
         return d
 
+    # ── Bull signals ───────────────────────────────────────────────────────────
     sma_b1 = _valid(sma20_1m) and price    > sma20_1m
     sma_b5 = _valid(sma20_5m) and price_5m > sma20_5m
     adx_b  = _valid(adx_val) and adx_val > 22 and _valid(dmp_val) and _valid(dmn_val) and dmp_val > dmn_val
     rsi_b  = _valid(rsi_1m)  and 45 < rsi_1m < 65
-    ftfc_b1= _valid(ftfc_1m) and ftfc_1m  > 0.6
-    ftfc_b5= _valid(ftfc_5m) and ftfc_5m  > 0.6
+    ftfc_b1= _valid(ftfc_1m) and ftfc_1m > 0.6
+    ftfc_b5= _valid(ftfc_5m) and ftfc_5m > 0.6
     st_b1  = _valid(st_1m)   and price    > st_1m
     st_b5  = _valid(st_5m)   and price_5m > st_5m
     vwap_b = _valid(vwap_val) and price   > vwap_val
 
+    # BB squeeze bull: squeeze detected AND price broke above upper band
+    bb_b = bool(bb_squeeze and bb_upper_val and price > bb_upper_val)
+    # MACD bull crossover: MACD line just crossed above signal line
+    macd_b = bool(
+        macd_val is not None and signal_val is not None and
+        macd_prev is not None and signal_prev is not None and
+        macd_val > signal_val and macd_prev <= signal_prev
+    )
+
     bull = {
-        "sma20":       bs("SMA20 MTF",      2, sma_b1 and sma_b5,   f"{sma20_1m:.2f}" if _valid(sma20_1m) else "--", sma_b1, sma_b5),
-        "adx":         bs("ADX Bull",        1, adx_b,               f"{adx_val:.1f}"  if _valid(adx_val)  else "--"),
-        "rsi":         bs("RSI 45-65",       1, rsi_b,               f"{rsi_1m:.1f}"   if _valid(rsi_1m)   else "--"),
-        "ftfc":        bs("FTFC MTF",        2, ftfc_b1 and ftfc_b5, f"{ftfc_1m*100:.0f}%" if _valid(ftfc_1m) else "--", ftfc_b1, ftfc_b5),
-        "supertrend":  bs("SuperTrend MTF",  1, st_b1 and st_b5,    f"{st_1m:.2f}"    if _valid(st_1m)    else "--", st_b1, st_b5),
-        "heikin_ashi": bs("HA Bull MTF",     1, ha_bull_1m and ha_bull_5m, "Bull" if ha_bull_1m else "Bear", ha_bull_1m, ha_bull_5m),
-        "vwap":        bs("Above VWAP",      1, vwap_b,              f"{vwap_val:.2f}" if _valid(vwap_val) else "--"),
-        "fvg":         bs("FVG Bull",        1, fvg_dir == 'bull',   fvg_dir.capitalize() if fvg_dir else "None"),
-        "ob":          bs("Order Block Bull",1, ob_dir  == 'bull',   ob_dir.capitalize()  if ob_dir  else "None"),
-        "rsi_div":     bs("RSI Div Bull",    1, rsi_div == 'bull',   rsi_div.capitalize() if rsi_div else "None"),
+        "sma20":       bs("SMA20 MTF",      2, sma_b1 and sma_b5,      f"{sma20_1m:.2f}" if _valid(sma20_1m) else "--",  sma_b1, sma_b5),
+        "adx":         bs("ADX Bull",        1, adx_b,                  f"{adx_val:.1f}"  if _valid(adx_val)  else "--"),
+        "rsi":         bs("RSI 45-65",       1, rsi_b,                  f"{rsi_1m:.1f}"   if _valid(rsi_1m)   else "--"),
+        "ftfc":        bs("FTFC MTF",        2, ftfc_b1 and ftfc_b5,    f"{ftfc_1m*100:.0f}%" if _valid(ftfc_1m) else "--", ftfc_b1, ftfc_b5),
+        "supertrend":  bs("SuperTrend MTF",  1, st_b1 and st_b5,       f"{st_1m:.2f}"    if _valid(st_1m)    else "--",  st_b1, st_b5),
+        "heikin_ashi": bs("HA Bull MTF",     1, ha_bull_1m and ha_bull_5m, "Bull" if ha_bull_1m else "Bear",             ha_bull_1m, ha_bull_5m),
+        "vwap":        bs("Above VWAP",      1, vwap_b,                 f"{vwap_val:.2f}" if _valid(vwap_val) else "--"),
+        "fvg":         bs("FVG Bull",        1, fvg_dir == 'bull',      fvg_dir.capitalize() if fvg_dir else "None"),
+        "ob":          bs("Order Block Bull",1, ob_dir  == 'bull',      ob_dir.capitalize()  if ob_dir  else "None"),
+        "rsi_div":     bs("RSI Div Bull",    1, rsi_div == 'bull',      rsi_div.capitalize() if rsi_div else "None"),
+        "bb":          bs("BB Squeeze ↑",    1, bb_b,                   f">{bb_upper_val:.2f}" if bb_upper_val else "--"),
+        "macd":        bs("MACD Cross ↑",    1, macd_b,                 f"{macd_val:.3f}" if macd_val is not None else "--"),
+        "orb":         bs("ORB Break ↑",     1, orb_dir == 'bull',      f">{orb_high:.2f}" if orb_high else "No ORB"),
+        "gap":         bs("Gap Up",          1, gap_dir == 'bull',      f"+{gap_pct:.2f}%" if (gap_pct is not None and gap_pct > 0) else (f"{gap_pct:.2f}%" if gap_pct is not None else "--")),
     }
     bull_score = sum(s['points'] for s in bull.values() if s['active'])
 
-    # ---- Bear signals ----
+    # ── Bear signals ───────────────────────────────────────────────────────────
     sma_r1  = _valid(sma20_1m) and price    < sma20_1m
     sma_r5  = _valid(sma20_5m) and price_5m < sma20_5m
     adx_r   = _valid(adx_val)  and adx_val > 22 and _valid(dmp_val) and _valid(dmn_val) and dmn_val > dmp_val
     rsi_r   = _valid(rsi_1m)   and 35 < rsi_1m < 55
-    ftfc_r1 = _valid(ftfc_1m)  and ftfc_1m  < 0.4
-    ftfc_r5 = _valid(ftfc_5m)  and ftfc_5m  < 0.4
+    ftfc_r1 = _valid(ftfc_1m)  and ftfc_1m < 0.4
+    ftfc_r5 = _valid(ftfc_5m)  and ftfc_5m < 0.4
     st_r1   = _valid(st_1m)    and price    < st_1m
     st_r5   = _valid(st_5m)    and price_5m < st_5m
     vwap_r  = _valid(vwap_val) and price    < vwap_val
 
+    bb_r   = bool(bb_squeeze and bb_lower_val and price < bb_lower_val)
+    macd_r = bool(
+        macd_val is not None and signal_val is not None and
+        macd_prev is not None and signal_prev is not None and
+        macd_val < signal_val and macd_prev >= signal_prev
+    )
+
     bear = {
-        "sma20":       bs("SMA20 MTF",      2, sma_r1 and sma_r5,    f"{sma20_1m:.2f}" if _valid(sma20_1m) else "--", sma_r1, sma_r5),
-        "adx":         bs("ADX Bear",        1, adx_r,                f"{adx_val:.1f}"  if _valid(adx_val)  else "--"),
-        "rsi":         bs("RSI 35-55",       1, rsi_r,                f"{rsi_1m:.1f}"   if _valid(rsi_1m)   else "--"),
-        "ftfc":        bs("FTFC Bear MTF",   2, ftfc_r1 and ftfc_r5,  f"{(1-ftfc_1m)*100:.0f}%" if _valid(ftfc_1m) else "--", ftfc_r1, ftfc_r5),
-        "supertrend":  bs("SuperTrend MTF",  1, st_r1 and st_r5,     f"{st_1m:.2f}"    if _valid(st_1m)    else "--", st_r1, st_r5),
-        "heikin_ashi": bs("HA Bear MTF",     1, (not ha_bull_1m) and (not ha_bull_5m), "Bear" if not ha_bull_1m else "Bull", not ha_bull_1m, not ha_bull_5m),
-        "vwap":        bs("Below VWAP",      1, vwap_r,               f"{vwap_val:.2f}" if _valid(vwap_val) else "--"),
-        "fvg":         bs("FVG Bear",        1, fvg_dir == 'bear',    fvg_dir.capitalize() if fvg_dir else "None"),
-        "ob":          bs("OB Bear",         1, ob_dir  == 'bear',    ob_dir.capitalize()  if ob_dir  else "None"),
-        "rsi_div":     bs("RSI Div Bear",    1, rsi_div == 'bear',    rsi_div.capitalize() if rsi_div else "None"),
+        "sma20":       bs("SMA20 MTF",       2, sma_r1 and sma_r5,     f"{sma20_1m:.2f}" if _valid(sma20_1m) else "--",  sma_r1, sma_r5),
+        "adx":         bs("ADX Bear",         1, adx_r,                 f"{adx_val:.1f}"  if _valid(adx_val)  else "--"),
+        "rsi":         bs("RSI 35-55",        1, rsi_r,                 f"{rsi_1m:.1f}"   if _valid(rsi_1m)   else "--"),
+        "ftfc":        bs("FTFC Bear MTF",    2, ftfc_r1 and ftfc_r5,   f"{(1-ftfc_1m)*100:.0f}%" if _valid(ftfc_1m) else "--", ftfc_r1, ftfc_r5),
+        "supertrend":  bs("SuperTrend MTF",   1, st_r1 and st_r5,      f"{st_1m:.2f}"    if _valid(st_1m)    else "--",  st_r1, st_r5),
+        "heikin_ashi": bs("HA Bear MTF",      1, (not ha_bull_1m) and (not ha_bull_5m), "Bear" if not ha_bull_1m else "Bull", not ha_bull_1m, not ha_bull_5m),
+        "vwap":        bs("Below VWAP",       1, vwap_r,                f"{vwap_val:.2f}" if _valid(vwap_val) else "--"),
+        "fvg":         bs("FVG Bear",         1, fvg_dir == 'bear',     fvg_dir.capitalize() if fvg_dir else "None"),
+        "ob":          bs("OB Bear",          1, ob_dir  == 'bear',     ob_dir.capitalize()  if ob_dir  else "None"),
+        "rsi_div":     bs("RSI Div Bear",     1, rsi_div == 'bear',     rsi_div.capitalize() if rsi_div else "None"),
+        "bb":          bs("BB Squeeze ↓",     1, bb_r,                  f"<{bb_lower_val:.2f}" if bb_lower_val else "--"),
+        "macd":        bs("MACD Cross ↓",     1, macd_r,                f"{macd_val:.3f}" if macd_val is not None else "--"),
+        "orb":         bs("ORB Break ↓",      1, orb_dir == 'bear',     f"<{orb_low:.2f}" if orb_low else "No ORB"),
+        "gap":         bs("Gap Down",         1, gap_dir == 'bear',     f"{gap_pct:.2f}%" if (gap_pct is not None and gap_pct < 0) else (f"+{gap_pct:.2f}%" if gap_pct is not None else "--")),
     }
     bear_score = sum(s['points'] for s in bear.values() if s['active'])
 
@@ -571,38 +704,52 @@ def compute_signals(df_1m, df_5m):
         direction = "NEUTRAL"
 
     return {
-        "price":       round(float(price), 2),
-        "bull_score":  int(bull_score),
-        "bear_score":  int(bear_score),
-        "direction":   direction,
+        "price":        round(price, 2),
+        "bull_score":   int(bull_score),
+        "bear_score":   int(bear_score),
+        "direction":    direction,
         "bull_signals": bull,
         "bear_signals": bear,
         "volume_spike": vol_spike,
         "vol_ratio":    vol_ratio,
+        "atr":          round(atr_val, 3) if _valid(atr_val) else None,
+        "bull_stop":    bull_stop,
+        "bull_tp":      bull_tp,
+        "bear_stop":    bear_stop,
+        "bear_tp":      bear_tp,
+        "pos_size":     pos_size,
+        "gap_pct":      gap_pct,
+        "gap_dir":      gap_dir,
+        "orb_high":     orb_high,
+        "orb_low":      orb_low,
     }
 
 
 async def scan_ticker(client, ticker, market_open):
     print(f"Scanning {ticker}...", flush=True)
 
-    df_1m = fetch_aggs(client, ticker, multiplier=1, days=5, limit=500)
-
-    if df_1m is None or len(df_1m) < 50:
-        print(f"⚠️ {ticker}: insufficient 1m data", flush=True)
+    # Fetch ~5 trading days of 1m bars (2000 > 5×390 RTH bars/day)
+    df_raw = fetch_aggs(client, ticker, multiplier=1, days=7, limit=2000)
+    if df_raw is None or len(df_raw) < 50:
+        print(f"⚠️ {ticker}: insufficient data", flush=True)
         return
 
-    df_5m = resample_to_5m(df_1m)   # resampled from 1m data, no extra API call
+    # Regular trading hours only: 9:30 – 16:00 ET
+    df_1m = _filter_rth(df_raw)
+    if len(df_1m) < 50:
+        df_1m = df_raw   # fall back to all bars if RTH filter is too aggressive
+
+    df_5m = resample_to_5m(df_1m)
     if len(df_5m) < 20:
         df_5m = df_1m
 
-    result = compute_signals(df_1m, df_5m)
-
-    price      = result['price']
-    bull_score = result['bull_score']
-    bear_score = result['bear_score']
-    direction  = result['direction']
-    vol_spike  = result['volume_spike']
-    score      = bull_score if direction != "BEAR" else bear_score
+    result    = compute_signals(df_1m, df_5m)
+    price     = result['price']
+    bull_score= result['bull_score']
+    bear_score= result['bear_score']
+    direction = result['direction']
+    vol_spike = result['volume_spike']
+    score     = bull_score if direction != "BEAR" else bear_score
 
     if not market_open:
         status = "MARKET_CLOSED"
@@ -611,15 +758,11 @@ async def scan_ticker(client, ticker, market_open):
     else:
         status = "REDUCED_RISK"
 
-    # Append history once per minute
+    # History (once per minute)
     history = dashboard_data[ticker]["history"]
     current_minute = datetime.now().strftime("%H:%M")
     if not history or history[-1]["time"] != current_minute:
-        history.append({
-            "time":       current_minute,
-            "bull_score": int(bull_score),
-            "bear_score": int(bear_score),
-        })
+        history.append({"time": current_minute, "bull_score": int(bull_score), "bear_score": int(bear_score)})
         if len(history) > 60:
             history.pop(0)
         save_history(ticker, history)
@@ -634,15 +777,25 @@ async def scan_ticker(client, ticker, market_open):
         "market_open":  market_open,
         "volume_spike": vol_spike,
         "vol_ratio":    result['vol_ratio'],
+        "atr":          result['atr'],
+        "bull_stop":    result['bull_stop'],
+        "bull_tp":      result['bull_tp'],
+        "bear_stop":    result['bear_stop'],
+        "bear_tp":      result['bear_tp'],
+        "pos_size":     result['pos_size'],
+        "gap_pct":      result['gap_pct'],
+        "gap_dir":      result['gap_dir'],
+        "orb_high":     result['orb_high'],
+        "orb_low":      result['orb_low'],
         "bull_signals": result['bull_signals'],
         "bear_signals": result['bear_signals'],
         "history":      history,
     })
 
-    # Log setup
+    # JSON signal log
     if score >= LOG_SCORE_THRESHOLD:
         global signal_log
-        signal_log.insert(0, {
+        entry = {
             "time":       datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             "ticker":     ticker,
             "price":      price,
@@ -650,22 +803,32 @@ async def scan_ticker(client, ticker, market_open):
             "bear_score": bear_score,
             "direction":  direction,
             "vol_spike":  vol_spike,
-        })
+            "atr":        result['atr'],
+            "stop":       result['bull_stop'] if direction != "BEAR" else result['bear_stop'],
+            "tp":         result['bull_tp']   if direction != "BEAR" else result['bear_tp'],
+            "gap_pct":    result['gap_pct'],
+            "orb_break":  result['orb_high'] is not None and direction == 'BULL' and price > result['orb_high'],
+        }
+        signal_log.insert(0, entry)
         signal_log = signal_log[:200]
         save_signal_log(signal_log)
+        log_to_csv(entry)
 
-    # Send external notifications
+    # External alerts
     if market_open and score >= ALERT_SCORE_THRESHOLD:
-        send_notifications(ticker, price, bull_score, bear_score, direction, vol_spike)
+        stop = result['bull_stop'] if direction != "BEAR" else result['bear_stop']
+        tp   = result['bull_tp']   if direction != "BEAR" else result['bear_tp']
+        send_notifications(ticker, price, bull_score, bear_score, direction,
+                           vol_spike, result['atr'], stop, tp)
 
-    # Volume spike notification (independent of score threshold)
     if market_open and vol_spike:
-        ratio = result['vol_ratio'] or "?"
-        print(f"⚡ VOLUME SPIKE [{ticker}]: {ratio}x avg", flush=True)
+        print(f"⚡ VOLUME SPIKE [{ticker}]: {result['vol_ratio']}x avg", flush=True)
 
     print(
         f"[{datetime.now().strftime('%H:%M:%S')}] {ticker} ${price:.2f} | "
         f"Bull:{bull_score} Bear:{bear_score} | {direction} | {status}"
+        + (f" | ATR:{result['atr']:.2f}" if result['atr'] else "")
+        + (f" | Gap:{result['gap_pct']:+.2f}%" if result['gap_pct'] is not None else "")
         + (" ⚡VOL" if vol_spike else ""),
         flush=True
     )
@@ -678,7 +841,7 @@ async def main():
         return
 
     client = RESTClient(POLYGON_API_KEY)
-    print(f"Scanning: {', '.join(WATCHLIST)}", flush=True)
+    print(f"Watchlist: {', '.join(WATCHLIST)}", flush=True)
 
     while True:
         try:
@@ -710,66 +873,73 @@ DASHBOARD_HTML = """<!DOCTYPE html>
   body{background:#0a0a0a;color:#ddd;font-family:'Segoe UI',sans-serif;font-size:.9rem}
   h1{color:#00ffcc;font-size:1.4rem;margin:0}
   .card{background:#111;border:1px solid #1e1e1e;border-radius:10px}
-  /* Ticker summary cards */
-  .tcrd{background:#0d0d0d;border:1px solid #222;border-radius:10px;padding:14px 18px;cursor:pointer;transition:border-color .2s}
+  .tcrd{background:#0d0d0d;border:1px solid #222;border-radius:10px;padding:12px 14px;cursor:pointer;transition:border-color .2s}
   .tcrd.active{border-color:#00ffcc}
   .tcrd:hover{border-color:#00ffcc88}
-  .tcrd .t-ticker{font-size:1.1rem;font-weight:700;color:#fff}
-  .tcrd .t-price{font-size:1.5rem;font-weight:700;color:#00ffcc;margin:4px 0}
-  .tcrd .t-score{font-size:.82rem}
-  .tcrd .t-dir{font-size:.8rem;font-weight:bold;padding:2px 8px;border-radius:10px}
+  .tcrd .t-ticker{font-size:1rem;font-weight:700;color:#fff}
+  .tcrd .t-price{font-size:1.35rem;font-weight:700;color:#00ffcc;margin:3px 0}
+  .tcrd .t-score{font-size:.78rem}
+  .tcrd .t-dir{font-size:.72rem;font-weight:bold;padding:2px 7px;border-radius:10px}
   .dir-bull{background:#00ff8822;color:#00ff88;border:1px solid #00ff8855}
   .dir-bear{background:#ff444422;color:#ff6666;border:1px solid #ff444455}
   .dir-neutral{background:#44444422;color:#888;border:1px solid #555}
   .dir-starting{background:#ffaa0022;color:#ffaa00;border:1px solid #ffaa0055}
-  /* Signal cards */
-  .sig-card{background:#0c0c0c;border:1px solid #1a1a1a;border-radius:6px;padding:8px 10px;margin-bottom:6px;transition:border-color .25s}
+  .sig-card{background:#0c0c0c;border:1px solid #1a1a1a;border-radius:6px;padding:7px 9px;margin-bottom:5px;transition:border-color .25s}
   .sig-card.active{border-color:#00ff8866}
-  .sig-card.inactive{opacity:.55}
-  .sig-label{font-size:.65rem;color:#666;text-transform:uppercase;letter-spacing:.8px}
-  .sig-val{font-size:.88rem;font-weight:600;margin-top:2px}
-  .sig-icon{float:right;font-size:.9rem}
-  .tf-badge{font-size:.58rem;padding:1px 5px;border-radius:8px;margin-left:3px}
+  .sig-card.inactive{opacity:.5}
+  .sig-label{font-size:.62rem;color:#666;text-transform:uppercase;letter-spacing:.7px}
+  .sig-val{font-size:.85rem;font-weight:600;margin-top:2px}
+  .sig-icon{float:right;font-size:.85rem}
+  .tf-badge{font-size:.56rem;padding:1px 4px;border-radius:8px;margin-left:2px}
   .tf-ok{background:#00ff8822;color:#00ff88}
   .tf-no{background:#ff444422;color:#ff6666}
-  /* Score bars */
-  .bar-wrap{background:#1a1a1a;border-radius:10px;height:7px;margin:4px 0}
-  .bar{height:7px;border-radius:10px;transition:width .4s,background .4s}
-  /* Tabs */
-  .tab-btn{background:#111;border:1px solid #333;color:#888;padding:5px 14px;border-radius:6px;cursor:pointer;font-size:.82rem;transition:all .2s}
+  .bar-wrap{background:#1a1a1a;border-radius:10px;height:6px;margin:3px 0}
+  .bar{height:6px;border-radius:10px;transition:width .4s,background .4s}
+  .tab-btn{background:#111;border:1px solid #333;color:#888;padding:4px 12px;border-radius:6px;cursor:pointer;font-size:.78rem;transition:all .2s}
   .tab-btn.active{background:#00ffcc22;border-color:#00ffcc;color:#00ffcc}
-  /* Alert items */
-  .alert-item{background:#0d0d0d;border-left:3px solid #ff9900;padding:7px 10px;margin-bottom:5px;border-radius:0 5px 5px 0;font-size:.78rem}
-  /* Status badge */
-  .sb{font-size:.78rem;padding:3px 10px;border-radius:12px;font-weight:600}
+  .alert-item{background:#0d0d0d;border-left:3px solid #ff9900;padding:6px 9px;margin-bottom:4px;border-radius:0 5px 5px 0;font-size:.76rem}
+  .sb{font-size:.75rem;padding:3px 9px;border-radius:12px;font-weight:600}
   .sb-normal{background:#00ff8822;color:#00ff88;border:1px solid #00ff88}
   .sb-risk{background:#ff444422;color:#ff4444;border:1px solid #ff4444}
   .sb-closed{background:#22222288;color:#666;border:1px solid #444}
   .sb-starting{background:#ffaa0022;color:#ffaa00;border:1px solid #ffaa00}
-  /* Signal log table */
-  .log-table{width:100%;font-size:.78rem;border-collapse:collapse}
-  .log-table th{color:#555;text-transform:uppercase;font-size:.65rem;letter-spacing:.8px;padding:4px 8px;border-bottom:1px solid #1e1e1e}
-  .log-table td{padding:5px 8px;border-bottom:1px solid #111}
+  .log-table{width:100%;font-size:.76rem;border-collapse:collapse}
+  .log-table th{color:#555;text-transform:uppercase;font-size:.62rem;letter-spacing:.8px;padding:4px 7px;border-bottom:1px solid #1e1e1e}
+  .log-table td{padding:4px 7px;border-bottom:1px solid #111}
   .log-bull{color:#00ff88}.log-bear{color:#ff6666}.log-neutral{color:#888}
-  /* Misc */
-  .section-title{color:#555;font-size:.65rem;text-transform:uppercase;letter-spacing:1.5px;margin-bottom:8px}
+  .section-title{color:#555;font-size:.63rem;text-transform:uppercase;letter-spacing:1.5px;margin-bottom:7px}
   .live-dot{display:inline-block;width:7px;height:7px;background:#00ff88;border-radius:50%;margin-right:6px;animation:pulse 2s infinite}
   .live-dot.off{background:#444;animation:none}
   @keyframes pulse{0%,100%{opacity:1}50%{opacity:.25}}
-  .vol-spike{background:#ff990022;border:1px solid #ff9900;color:#ff9900;border-radius:5px;padding:2px 8px;font-size:.72rem}
-  .sound-btn{background:#111;border:1px solid #333;color:#888;padding:4px 12px;border-radius:6px;cursor:pointer;font-size:.78rem}
+  .vol-spike{background:#ff990022;border:1px solid #ff9900;color:#ff9900;border-radius:5px;padding:2px 7px;font-size:.7rem}
+  .sound-btn{background:#111;border:1px solid #333;color:#888;padding:3px 10px;border-radius:6px;cursor:pointer;font-size:.76rem}
   .sound-btn.on{border-color:#00ffcc;color:#00ffcc}
+  /* Risk panel */
+  .risk-chip{display:inline-block;background:#0d0d0d;border:1px solid #222;border-radius:6px;padding:5px 10px;margin:3px;font-size:.78rem}
+  .risk-chip .rc-label{font-size:.6rem;color:#555;text-transform:uppercase;letter-spacing:.8px;display:block}
+  .risk-chip .rc-val{font-weight:700;margin-top:1px}
+  /* Gap/ORB badges */
+  .ctx-badge{display:inline-block;padding:2px 8px;border-radius:10px;font-size:.72rem;font-weight:600;margin:2px}
+  .ctx-bull{background:#00ff8815;color:#00ff88;border:1px solid #00ff8844}
+  .ctx-bear{background:#ff444415;color:#ff6666;border:1px solid #ff444444}
+  .ctx-neutral{background:#22222288;color:#888;border:1px solid #333}
+  /* Mobile tweaks */
+  @media(max-width:576px){
+    .tcrd{padding:9px 10px}
+    .tcrd .t-price{font-size:1.1rem}
+    h1{font-size:1.1rem}
+  }
 </style>
 </head>
-<body class="p-3">
+<body class="p-2 p-md-3">
 <div class="container-fluid">
 
   <!-- Header -->
-  <div class="d-flex align-items-center gap-3 mb-3 flex-wrap">
+  <div class="d-flex align-items-center gap-2 mb-3 flex-wrap">
     <span class="live-dot" id="live-dot"></span>
     <h1>SPX Confluence Scanner</h1>
-    <span id="mkt-badge" class="sb sb-starting">STARTING</span>
-    <span class="ms-auto text-muted" style="font-size:.75rem">Updated: <span id="last-update">--</span></span>
+    <span id="mkt-badge" class="sb sb-starting ms-1">STARTING</span>
+    <span class="ms-auto text-muted" style="font-size:.72rem">Updated: <span id="last-update">--</span></span>
     <button class="sound-btn on" id="sound-btn" onclick="toggleSound()">🔔 Sound ON</button>
   </div>
 
@@ -778,18 +948,30 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 
   <!-- Detail Panel -->
   <div class="card p-3 mb-3">
-    <div class="d-flex align-items-center gap-2 mb-3" id="detail-header">
+    <!-- Tab bar -->
+    <div class="d-flex align-items-center gap-2 mb-2 flex-wrap">
       <div class="section-title mb-0" id="detail-title">SPY — Signals</div>
-      <div class="ms-2 d-flex gap-1" id="dir-tabs">
+      <div class="d-flex gap-1">
         <button class="tab-btn active" id="tab-bull" onclick="setDir('bull')">🔼 Bull</button>
         <button class="tab-btn"        id="tab-bear" onclick="setDir('bear')">🔽 Bear</button>
       </div>
-      <span id="vol-spike-badge" class="vol-spike d-none ms-2">⚡ VOL SPIKE</span>
+      <span id="vol-spike-badge" class="vol-spike d-none">⚡ VOL SPIKE</span>
     </div>
-    <div class="row g-2" id="signal-grid"></div>
+
+    <!-- Context row: Gap + ORB -->
+    <div id="ctx-row" class="mb-2"></div>
+
+    <!-- Signal Grid -->
+    <div class="row g-2 mb-3" id="signal-grid"></div>
+
+    <!-- ATR Risk Panel -->
+    <div>
+      <div class="section-title">ATR Risk Levels</div>
+      <div id="risk-panel" class="d-flex flex-wrap gap-1"></div>
+    </div>
   </div>
 
-  <!-- Charts Row -->
+  <!-- Charts + Alerts Row -->
   <div class="row g-3 mb-3">
     <div class="col-md-5">
       <div class="card p-3">
@@ -800,14 +982,15 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     <div class="col-md-4">
       <div class="card p-3 h-100">
         <div class="section-title">Recent Alerts</div>
-        <div id="alerts-panel"><span class="text-muted">No alerts yet</span></div>
+        <div id="alerts-panel"><span class="text-muted" style="font-size:.82rem">No alerts yet</span></div>
       </div>
     </div>
     <div class="col-md-3">
       <div class="card p-3 h-100">
         <div class="section-title">TradingView</div>
-        <iframe src="https://www.tradingview.com/widgetembed/?symbol=AMEX:SPY&interval=1&theme=dark"
-          width="100%" height="220" frameborder="0" id="tv-frame"></iframe>
+        <iframe id="tv-frame"
+          src="https://www.tradingview.com/widgetembed/?symbol=AMEX:SPY&interval=1&theme=dark"
+          width="100%" height="220" frameborder="0"></iframe>
       </div>
     </div>
   </div>
@@ -819,33 +1002,39 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       <table class="log-table">
         <thead><tr>
           <th>Time</th><th>Ticker</th><th>Price</th>
-          <th>Bull</th><th>Bear</th><th>Direction</th><th>Vol</th>
+          <th>Bull</th><th>Bear</th><th>Dir</th>
+          <th>ATR</th><th>Stop</th><th>TP</th><th>Gap</th><th>Vol</th>
         </tr></thead>
-        <tbody id="log-body"><tr><td colspan="7" style="color:#555;text-align:center">No setups logged yet</td></tr></tbody>
+        <tbody id="log-body">
+          <tr><td colspan="11" style="color:#555;text-align:center;padding:12px">No setups logged yet</td></tr>
+        </tbody>
       </table>
     </div>
   </div>
 
-</div><!-- /container -->
+</div>
 
 <script>
-// ---- State ----
-let allData   = {};
-let signalLog = [];
-let curTicker = 'SPY';
-let curDir    = 'bull';
-let soundOn   = true;
-let prevScores = {};   // {ticker: {bull, bear}}
+let allData    = {};
+let signalLog  = [];
+let curTicker  = 'SPY';
+let curDir     = 'bull';
+let soundOn    = true;
+let prevScores = {};
 let scoreChart = null;
 
 const MAX_SCORE = """ + str(MAX_SCORE) + """;
 
-// ---- Sound ----
+const TV_SYMBOLS = {
+  SPY:'AMEX:SPY', QQQ:'NASDAQ:QQQ', IWM:'AMEX:IWM',
+  NVDA:'NASDAQ:NVDA', AAPL:'NASDAQ:AAPL'
+};
+
 function toggleSound() {
   soundOn = !soundOn;
   const btn = document.getElementById('sound-btn');
   btn.textContent = soundOn ? '🔔 Sound ON' : '🔕 Sound OFF';
-  btn.className = soundOn ? 'sound-btn on' : 'sound-btn';
+  btn.className   = soundOn ? 'sound-btn on' : 'sound-btn';
 }
 
 function playAlert(freq, count) {
@@ -853,11 +1042,9 @@ function playAlert(freq, count) {
   if (!ACtx || !soundOn) return;
   const ctx = new ACtx();
   for (let i = 0; i < (count || 1); i++) {
-    const osc  = ctx.createOscillator();
-    const gain = ctx.createGain();
+    const osc = ctx.createOscillator(), gain = ctx.createGain();
     osc.connect(gain); gain.connect(ctx.destination);
-    osc.frequency.value = freq || 880;
-    osc.type = 'sine';
+    osc.frequency.value = freq || 880; osc.type = 'sine';
     const t = ctx.currentTime + i * 0.18;
     gain.gain.setValueAtTime(0.25, t);
     gain.gain.exponentialRampToValueAtTime(0.001, t + 0.25);
@@ -865,7 +1052,6 @@ function playAlert(freq, count) {
   }
 }
 
-// ---- Score color ----
 function scoreColor(s) {
   const p = s / MAX_SCORE;
   if (p >= 0.75) return '#00ff88';
@@ -874,16 +1060,24 @@ function scoreColor(s) {
   return '#ff4444';
 }
 
-// ---- Ticker cards ----
+function fmt(v, prefix='$', dec=2) {
+  if (v == null) return '--';
+  return prefix + parseFloat(v).toFixed(dec);
+}
+
+// ── Ticker summary cards ──────────────────────────────────────────────────────
 function renderTickerRow() {
   const row = document.getElementById('ticker-row');
   row.innerHTML = '';
   for (const ticker of Object.keys(allData)) {
     const d = allData[ticker];
     const score  = d.direction === 'BEAR' ? d.bear_score : d.bull_score;
-    const dirCls = {BULL:'dir-bull',BEAR:'dir-bear',NEUTRAL:'dir-neutral',STARTING:'dir-starting'}[d.direction] || 'dir-starting';
+    const dirCls = {BULL:'dir-bull',BEAR:'dir-bear',NEUTRAL:'dir-neutral'}[d.direction] || 'dir-starting';
+    const gapHtml = d.gap_pct != null
+      ? `<span class="ctx-badge ${d.gap_pct>0?'ctx-bull':d.gap_pct<0?'ctx-bear':'ctx-neutral'}">${d.gap_pct>0?'+':''}${d.gap_pct.toFixed(2)}%</span>`
+      : '';
     const col = document.createElement('div');
-    col.className = 'col';
+    col.className = 'col-6 col-sm-4 col-md-3 col-xl-2';
     col.innerHTML = `
       <div class="tcrd${ticker===curTicker?' active':''}" onclick="selectTicker('${ticker}')">
         <div class="d-flex justify-content-between align-items-start">
@@ -891,11 +1085,12 @@ function renderTickerRow() {
           <span class="t-dir ${dirCls}">${d.direction}</span>
         </div>
         <div class="t-price">$${d.price.toFixed(2)}</div>
-        <div class="t-score d-flex gap-2">
+        <div class="t-score d-flex align-items-center gap-1 flex-wrap">
           <span style="color:#00ff88">▲${d.bull_score}</span>
           <span style="color:#ff6666">▼${d.bear_score}</span>
-          <span style="color:#555">/${MAX_SCORE}</span>
-          ${d.volume_spike ? '<span class="vol-spike">⚡</span>' : ''}
+          <span style="color:#444">/${MAX_SCORE}</span>
+          ${gapHtml}
+          ${d.volume_spike?'<span class="vol-spike" style="padding:1px 5px">⚡</span>':''}
         </div>
         <div class="bar-wrap mt-1">
           <div class="bar" style="width:${Math.min(score/MAX_SCORE*100,100)}%;background:${scoreColor(score)}"></div>
@@ -905,83 +1100,135 @@ function renderTickerRow() {
   }
 }
 
-// ---- Select ticker ----
-function selectTicker(ticker) {
-  curTicker = ticker;
+// ── Select ticker ─────────────────────────────────────────────────────────────
+function selectTicker(t) {
+  curTicker = t;
   renderTickerRow();
   renderSignals();
+  renderRiskPanel();
+  renderContextRow();
   renderAlerts();
   updateChart();
-  document.getElementById('detail-title').textContent = ticker + ' — Signals';
-  document.getElementById('chart-ticker').textContent = ticker;
-  const tvSym = {SPY:'AMEX:SPY',QQQ:'NASDAQ:QQQ',IWM:'AMEX:IWM'}[ticker] || 'AMEX:SPY';
+  document.getElementById('detail-title').textContent = t + ' — Signals';
+  document.getElementById('chart-ticker').textContent = t;
   document.getElementById('tv-frame').src =
-    `https://www.tradingview.com/widgetembed/?symbol=${tvSym}&interval=1&theme=dark`;
+    `https://www.tradingview.com/widgetembed/?symbol=${TV_SYMBOLS[t]||'AMEX:SPY'}&interval=1&theme=dark`;
 }
 
-// ---- Dir tabs ----
+// ── Direction tabs ────────────────────────────────────────────────────────────
 function setDir(dir) {
   curDir = dir;
   document.getElementById('tab-bull').className = 'tab-btn' + (dir==='bull'?' active':'');
   document.getElementById('tab-bear').className = 'tab-btn' + (dir==='bear'?' active':'');
   renderSignals();
+  renderRiskPanel();
 }
 
-// ---- Signal grid ----
+// ── Context row (Gap + ORB) ────────────────────────────────────────────────────
+function renderContextRow() {
+  const d = allData[curTicker];
+  if (!d) return;
+  const row = document.getElementById('ctx-row');
+  let html = '';
+
+  if (d.gap_pct != null) {
+    const cls = d.gap_pct > 0 ? 'ctx-bull' : d.gap_pct < 0 ? 'ctx-bear' : 'ctx-neutral';
+    html += `<span class="ctx-badge ${cls}">Gap ${d.gap_pct>0?'+':''}${d.gap_pct.toFixed(2)}%</span>`;
+  }
+  if (d.orb_high != null) {
+    html += `<span class="ctx-badge ctx-neutral">ORB H: $${d.orb_high.toFixed(2)}</span>`;
+    html += `<span class="ctx-badge ctx-neutral">ORB L: $${d.orb_low.toFixed(2)}</span>`;
+    if (d.price > d.orb_high)
+      html += `<span class="ctx-badge ctx-bull">▲ Above ORB</span>`;
+    else if (d.price < d.orb_low)
+      html += `<span class="ctx-badge ctx-bear">▼ Below ORB</span>`;
+    else
+      html += `<span class="ctx-badge ctx-neutral">Inside ORB</span>`;
+  }
+  row.innerHTML = html;
+}
+
+// ── Signal grid ───────────────────────────────────────────────────────────────
 function renderSignals() {
   const d = allData[curTicker];
   if (!d) return;
   const signals = curDir === 'bull' ? d.bull_signals : d.bear_signals;
   const grid = document.getElementById('signal-grid');
   grid.innerHTML = '';
-  for (const [, sig] of Object.entries(signals)) {
+  for (const [, sig] of Object.entries(signals || {})) {
     const col = document.createElement('div');
-    col.className = 'col-6 col-xl-4 col-xxl-3';
-    let tfHtml = '';
-    if (sig.tf1 !== undefined) {
-      tfHtml = `<span class="tf-badge ${sig.tf1?'tf-ok':'tf-no'}">1m</span>`
-             + `<span class="tf-badge ${sig.tf5?'tf-ok':'tf-no'}">5m</span>`;
-    }
+    col.className = 'col-6 col-md-4 col-xl-3';
+    const tfHtml = sig.tf1 !== undefined
+      ? `<span class="tf-badge ${sig.tf1?'tf-ok':'tf-no'}">1m</span><span class="tf-badge ${sig.tf5?'tf-ok':'tf-no'}">5m</span>`
+      : '';
     const color = sig.active ? (curDir==='bull'?'#00ff88':'#ff6666') : '#444';
     col.innerHTML = `<div class="sig-card ${sig.active?'active':'inactive'}">
       <span class="sig-icon">${sig.active?(curDir==='bull'?'✅':'🔴'):'❌'}</span>
-      <div class="sig-label">${sig.label} ${tfHtml} <small style="color:#555">${sig.points}pt</small></div>
+      <div class="sig-label">${sig.label} ${tfHtml} <small style="color:#444">${sig.points}pt</small></div>
       <div class="sig-val" style="color:${color}">${sig.value}</div>
     </div>`;
     grid.appendChild(col);
   }
-  const d2 = allData[curTicker];
+
   const vsBadge = document.getElementById('vol-spike-badge');
+  const d2 = allData[curTicker];
   if (d2 && d2.volume_spike) {
     vsBadge.classList.remove('d-none');
-    vsBadge.textContent = '⚡ VOL SPIKE ' + (d2.vol_ratio ? d2.vol_ratio + 'x' : '');
+    vsBadge.textContent = '⚡ VOL SPIKE ' + (d2.vol_ratio ? d2.vol_ratio+'x' : '');
   } else {
     vsBadge.classList.add('d-none');
   }
 }
 
-// ---- Alerts ----
+// ── ATR Risk Panel ────────────────────────────────────────────────────────────
+function renderRiskPanel() {
+  const d = allData[curTicker];
+  if (!d) return;
+  const panel  = document.getElementById('risk-panel');
+  const isBull = curDir === 'bull';
+  const sl     = isBull ? d.bull_stop : d.bear_stop;
+  const tp     = isBull ? d.bull_tp   : d.bear_tp;
+
+  function chip(label, val, color) {
+    return `<div class="risk-chip">
+      <span class="rc-label">${label}</span>
+      <span class="rc-val" style="color:${color}">${val}</span>
+    </div>`;
+  }
+
+  panel.innerHTML =
+    chip('ATR(14)',     d.atr    ? d.atr.toFixed(2)          : '--',  '#ffaa00') +
+    chip('Stop Loss',   sl       ? '$'+sl.toFixed(2)          : '--',  '#ff6666') +
+    chip('Take Profit', tp       ? '$'+tp.toFixed(2)          : '--',  '#00ff88') +
+    chip('Pos. Size',   d.pos_size ? d.pos_size+' shares'     : '--',  '#00ffcc') +
+    chip('Risk/Trade',  d.pos_size && sl && d.price
+      ? '$'+(Math.abs(d.price - sl) * d.pos_size).toFixed(0) : '--',  '#aaa') +
+    chip('R:R',         (sl && tp && d.price)
+      ? (Math.abs(tp - d.price) / Math.abs(d.price - sl)).toFixed(1)+'x' : '--', '#aaa');
+}
+
+// ── Alerts ────────────────────────────────────────────────────────────────────
 function renderAlerts() {
   const d = allData[curTicker];
   if (!d) return;
   const panel = document.getElementById('alerts-panel');
   if (!d.alerts || d.alerts.length === 0) {
-    panel.innerHTML = '<span class="text-muted" style="font-size:.82rem">No alerts yet</span>';
+    panel.innerHTML = '<span class="text-muted" style="font-size:.8rem">No alerts yet</span>';
     return;
   }
   panel.innerHTML = d.alerts.map(a => {
-    const clr = a.direction==='BULL'?'#00ff88':'#ff6666';
+    const clr = a.direction==='BULL' ? '#00ff88' : '#ff6666';
     return `<div class="alert-item">
       <span style="color:#ffaa00">${a.time}</span>
-      <span class="ms-2" style="color:${clr};font-weight:600">${a.direction}</span>
+      <span class="ms-2 fw-bold" style="color:${clr}">${a.direction}</span>
       <span class="ms-2">$${a.price.toFixed(2)}</span>
-      <span class="ms-2 text-muted">Score ${a.score}</span>
-      <div style="color:#888;font-size:.72rem;margin-top:2px">${a.message}</div>
+      <span class="ms-1 text-muted">· ${a.score}pts</span>
+      <div style="color:#777;font-size:.7rem;margin-top:2px">${a.message}</div>
     </div>`;
   }).join('');
 }
 
-// ---- Chart ----
+// ── Score Chart ───────────────────────────────────────────────────────────────
 function initChart() {
   const ctx = document.getElementById('scoreChart').getContext('2d');
   scoreChart = new Chart(ctx, {
@@ -994,11 +1241,10 @@ function initChart() {
       ]
     },
     options: {
-      responsive:true,
-      animation:{duration:250},
+      responsive:true, animation:{duration:250},
       interaction:{mode:'index',intersect:false},
       scales:{
-        x:{ticks:{color:'#444',maxTicksLimit:8,font:{size:9}},grid:{color:'#1a1a1a'}},
+        x:{ticks:{color:'#444',maxTicksLimit:8,font:{size:9}}, grid:{color:'#1a1a1a'}},
         y:{min:0,max:MAX_SCORE,ticks:{color:'#444',stepSize:2},grid:{color:'#1a1a1a'}}
       },
       plugins:{legend:{labels:{color:'#555',font:{size:10}}}}
@@ -1009,39 +1255,45 @@ function initChart() {
 function updateChart() {
   const d = allData[curTicker];
   if (!d || !d.history || d.history.length === 0 || !scoreChart) return;
-  scoreChart.data.labels = d.history.map(h => h.time);
+  scoreChart.data.labels           = d.history.map(h => h.time);
   scoreChart.data.datasets[0].data = d.history.map(h => h.bull_score);
   scoreChart.data.datasets[1].data = d.history.map(h => h.bear_score);
   scoreChart.update('none');
 }
 
-// ---- Signal log ----
+// ── Signal log table ──────────────────────────────────────────────────────────
 function renderLog() {
-  const tbody = document.getElementById('log-body');
   if (!signalLog || signalLog.length === 0) return;
+  const tbody = document.getElementById('log-body');
   tbody.innerHTML = signalLog.slice(0, 50).map(e => {
-    const dirCls = e.direction==='BULL'?'log-bull':e.direction==='BEAR'?'log-bear':'log-neutral';
+    const dc = e.direction==='BULL'?'log-bull':e.direction==='BEAR'?'log-bear':'log-neutral';
+    const gapHtml = e.gap_pct != null
+      ? `<span style="color:${e.gap_pct>0?'#00ff88':'#ff6666'}">${e.gap_pct>0?'+':''}${e.gap_pct.toFixed(2)}%</span>`
+      : '--';
     return `<tr>
-      <td style="color:#555">${e.time}</td>
+      <td style="color:#555;white-space:nowrap">${e.time}</td>
       <td style="font-weight:600">${e.ticker}</td>
       <td>$${e.price.toFixed(2)}</td>
       <td class="log-bull">${e.bull_score}</td>
       <td class="log-bear">${e.bear_score}</td>
-      <td class="${dirCls} fw-bold">${e.direction}</td>
-      <td>${e.vol_spike ? '⚡' : ''}</td>
+      <td class="${dc} fw-bold">${e.direction}</td>
+      <td style="color:#ffaa00">${e.atr ? e.atr.toFixed(2) : '--'}</td>
+      <td style="color:#ff6666">${e.stop ? '$'+e.stop.toFixed(2) : '--'}</td>
+      <td style="color:#00ff88">${e.tp   ? '$'+e.tp.toFixed(2)   : '--'}</td>
+      <td>${gapHtml}</td>
+      <td>${e.vol_spike?'⚡':''}</td>
     </tr>`;
   }).join('');
 }
 
-// ---- Main update loop ----
+// ── Main poll loop ────────────────────────────────────────────────────────────
 async function update() {
   try {
     const res  = await fetch('/api/status');
     const data = await res.json();
-    allData   = data.tickers || {};
+    allData   = data.tickers   || {};
     signalLog = data.signal_log || [];
 
-    // Market badge
     const mktBadge = document.getElementById('mkt-badge');
     if (data.market_open) {
       mktBadge.className = 'sb sb-normal'; mktBadge.textContent = 'MARKET OPEN';
@@ -1051,23 +1303,22 @@ async function update() {
       document.getElementById('live-dot').className = 'live-dot off';
     }
 
-    // Sound check & last-update
     let latestUpdate = '--';
     for (const [ticker, d] of Object.entries(allData)) {
-      const prev = prevScores[ticker] || {bull:0,bear:0};
-      const newBull = d.bull_score, newBear = d.bear_score;
-      const prevMax = Math.max(prev.bull, prev.bear);
-      const newMax  = Math.max(newBull, newBear);
-      if (newMax >= 8 && newMax > prevMax) {
-        playAlert(newMax >= 10 ? 1100 : 880, newMax >= 10 ? 3 : 2);
-      }
-      prevScores[ticker] = {bull: newBull, bear: newBear};
+      const prev    = prevScores[ticker] || {bull:0,bear:0};
+      const newMax  = Math.max(d.bull_score, d.bear_score);
+      const prevMax = Math.max(prev.bull,    prev.bear);
+      if (newMax >= 8 && newMax > prevMax)
+        playAlert(newMax >= 11 ? 1100 : 880, newMax >= 11 ? 3 : 2);
+      prevScores[ticker] = {bull: d.bull_score, bear: d.bear_score};
       if (d.last_update !== 'N/A') latestUpdate = d.last_update;
     }
     document.getElementById('last-update').textContent = latestUpdate;
 
     renderTickerRow();
     renderSignals();
+    renderRiskPanel();
+    renderContextRow();
     renderAlerts();
     updateChart();
     renderLog();
@@ -1076,7 +1327,6 @@ async function update() {
   }
 }
 
-// ---- Init ----
 initChart();
 update();
 setInterval(update, 5000);
