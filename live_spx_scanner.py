@@ -10,6 +10,9 @@ import time
 import traceback
 from datetime import datetime, date, timedelta, timezone
 from email.mime.text import MIMEText
+from zoneinfo import ZoneInfo
+
+_ET = ZoneInfo('America/New_York')
 
 import pandas as pd
 import pandas_ta as ta
@@ -33,7 +36,7 @@ WATCHLIST             = ["SPY", "QQQ", "IWM", "NVDA", "AAPL"]
 SIGNAL_LOG_FILE       = "/tmp/signal_log.json"
 CSV_LOG_FILE          = "/tmp/signals.csv"
 HISTORY_FILE_TMPL     = "/tmp/score_history_{}.json"
-MAX_SCORE             = 18       # 17 Phase-2 + Put/Call Ratio (1pt per direction)
+MAX_SCORE             = 20       # 18 + trend_15m (1pt) + trend_1h (1pt) per direction
 ALERT_COOLDOWN_SECS   = 900
 VOLUME_SPIKE_MULT     = 3.0
 ALERT_SCORE_THRESHOLD = 9
@@ -517,6 +520,9 @@ _blank_ticker = lambda t: {
     "pcr_oi":       None,
     "call_vol":     None,
     "put_vol":      None,
+    "trend_15m":    None,
+    "trend_1h":     None,
+    "tod_ok":       True,
     "bull_signals": {},
     "bear_signals": {},
     "history":      load_history(t),
@@ -692,6 +698,22 @@ def resample_to_5m(df_1m):
     return df5.reset_index(drop=True)
 
 
+def _resample(df_1m, rule):
+    """Generic resampler — mirrors resample_to_5m structure."""
+    df = df_1m.copy()
+    df['datetime'] = pd.to_datetime(df['ts'], unit='ms', utc=True)
+    df = df.set_index('datetime')
+    out = df.resample(rule).agg({
+        'Open': 'first', 'High': 'max', 'Low': 'min',
+        'Close': 'last', 'Volume': 'sum', 'ts': 'first',
+    }).dropna(subset=['Open', 'Close'])
+    out['date'] = out.index.date
+    return out.reset_index(drop=True)
+
+def resample_to_15m(df_1m): return _resample(df_1m, '15min')
+def resample_to_1h(df_1m):  return _resample(df_1m, '1h')
+
+
 def fetch_aggs(client, ticker, multiplier, days, limit=500):
     try:
         end   = datetime.now(timezone.utc)
@@ -774,6 +796,36 @@ def compute_signals(df_1m, df_5m, ticker=None):
         atr_val = float(atr_s.iloc[-1]) if (atr_s is not None and _valid(atr_s.iloc[-1])) else None
     except Exception:
         pass
+
+    # ── 15m trend: EMA(9) vs EMA(21) ─────────────────────────────────────────
+    trend_15m = None
+    try:
+        df15 = resample_to_15m(df_1m)
+        if len(df15) >= 21:
+            ema9_15  = ta.ema(df15['Close'], length=9)
+            ema21_15 = ta.ema(df15['Close'], length=21)
+            if _valid(ema9_15.iloc[-1]) and _valid(ema21_15.iloc[-1]):
+                trend_15m = 'bull' if ema9_15.iloc[-1] > ema21_15.iloc[-1] else 'bear'
+    except Exception:
+        pass
+
+    # ── 1h trend: EMA(9) vs EMA(21) ──────────────────────────────────────────
+    trend_1h = None
+    try:
+        df1h = resample_to_1h(df_1m)
+        if len(df1h) >= 21:
+            ema9_1h  = ta.ema(df1h['Close'], length=9)
+            ema21_1h = ta.ema(df1h['Close'], length=21)
+            if _valid(ema9_1h.iloc[-1]) and _valid(ema21_1h.iloc[-1]):
+                trend_1h = 'bull' if ema9_1h.iloc[-1] > ema21_1h.iloc[-1] else 'bear'
+    except Exception:
+        pass
+
+    # ── Time-of-day filter (9:30-9:44 and 15:55-16:00 are suppressed) ────────
+    et_now  = datetime.now(timezone.utc).astimezone(_ET)
+    in_open = et_now.hour == 9  and et_now.minute < 45     # first 15 min
+    in_close= et_now.hour == 15 and et_now.minute >= 55    # last 5 min
+    tod_ok  = not (in_open or in_close)
 
     # ── 5m indicators ─────────────────────────────────────────────────────────
     df5 = df_5m.copy()
@@ -927,6 +979,8 @@ def compute_signals(df_1m, df_5m, ticker=None):
         "gap":         bs("Gap Up",          1, gap_dir == 'bull',      f"+{gap_pct:.2f}%" if (gap_pct is not None and gap_pct > 0) else (f"{gap_pct:.2f}%" if gap_pct is not None else "--")),
         "vix":         bs("Breadth Bull",     1, vix_bull,               vix_label),
         "pcr":         bs("P/C Ratio Bull",   1, pcr_bull,               pcr_label),
+        "trend_15m":   bs("15m Trend ↑",      1, trend_15m == 'bull',    trend_15m or "No data"),
+        "trend_1h":    bs("1h Trend ↑",       1, trend_1h  == 'bull',    trend_1h  or "No data"),
     }
     bull_score = sum(s['points'] for s in bull.values() if s['active'])
 
@@ -965,6 +1019,8 @@ def compute_signals(df_1m, df_5m, ticker=None):
         "gap":         bs("Gap Down",         1, gap_dir == 'bear',     f"{gap_pct:.2f}%" if (gap_pct is not None and gap_pct < 0) else (f"+{gap_pct:.2f}%" if gap_pct is not None else "--")),
         "vix":         bs("Breadth Bear",     1, vix_bear,               vix_label),
         "pcr":         bs("P/C Ratio Bear",   1, pcr_bear,               pcr_label),
+        "trend_15m":   bs("15m Trend ↓",      1, trend_15m == 'bear',    trend_15m or "No data"),
+        "trend_1h":    bs("1h Trend ↓",       1, trend_1h  == 'bear',    trend_1h  or "No data"),
     }
     bear_score = sum(s['points'] for s in bear.values() if s['active'])
 
@@ -994,6 +1050,9 @@ def compute_signals(df_1m, df_5m, ticker=None):
         "gap_dir":      gap_dir,
         "orb_high":     orb_high,
         "orb_low":      orb_low,
+        "trend_15m":    trend_15m,
+        "trend_1h":     trend_1h,
+        "tod_ok":       tod_ok,
     }
 
 
@@ -1119,8 +1178,8 @@ def update_market_breadth():
 async def scan_ticker(client, ticker, market_open):
     print(f"Scanning {ticker}...", flush=True)
 
-    # Fetch ~5 trading days of 1m bars (2000 > 5×390 RTH bars/day)
-    df_raw = fetch_aggs(client, ticker, multiplier=1, days=7, limit=2000)
+    # Fetch ~7 trading days of 1m bars; limit=7000 covers 7d incl. pre/post-market
+    df_raw = fetch_aggs(client, ticker, multiplier=1, days=10, limit=7000)
     if df_raw is None or len(df_raw) < 50:
         print(f"⚠️ {ticker}: insufficient data", flush=True)
         return
@@ -1200,6 +1259,9 @@ async def scan_ticker(client, ticker, market_open):
         "pm_gap_pct":   pm_gap_pct,
         "orb_high":     result['orb_high'],
         "orb_low":      result['orb_low'],
+        "trend_15m":    result['trend_15m'],
+        "trend_1h":     result['trend_1h'],
+        "tod_ok":       result['tod_ok'],
         # PCR from options_data (updated by fetch_options_flow, not per-scan)
         "pcr":          options_data.get(ticker, {}).get("pcr"),
         "pcr_oi":       options_data.get(ticker, {}).get("pcr_oi"),
@@ -1301,9 +1363,7 @@ async def main():
                 check_outcomes()
 
             # Daily summary: send once after 16:05 ET on trading days
-            et_now = datetime.now(timezone.utc).astimezone(
-                __import__('zoneinfo', fromlist=['ZoneInfo']).ZoneInfo('America/New_York')
-            )
+            et_now = datetime.now(timezone.utc).astimezone(_ET)
             today = et_now.date()
             if (
                 et_now.hour == 16 and et_now.minute >= 5
@@ -1633,6 +1693,11 @@ function renderTickerRow() {
           ${gapHtml}
           ${d.volume_spike?'<span class="vol-spike" style="padding:1px 5px">⚡</span>':''}
         </div>
+        <div style="font-size:.65rem;margin-top:3px;color:#555">
+          ${d.trend_15m ? `<span style="color:${d.trend_15m==='bull'?'#00ff88':'#ff6666'}">15m ${d.trend_15m==='bull'?'▲':'▼'}</span>` : ''}
+          ${d.trend_1h  ? `<span class="ms-1" style="color:${d.trend_1h==='bull'?'#00ff88':'#ff6666'}">1h ${d.trend_1h==='bull'?'▲':'▼'}</span>` : ''}
+          ${d.tod_ok === false ? '<span class="ms-1" style="color:#ffaa00">⏸ TOD</span>' : ''}
+        </div>
         <div class="bar-wrap mt-1">
           <div class="bar" style="width:${Math.min(score/MAX_SCORE*100,100)}%;background:${scoreColor(score)}"></div>
         </div>
@@ -1717,6 +1782,19 @@ function renderContextRow() {
       html += `<span class="ctx-badge ctx-bear">▼ Below ORB</span>`;
     else
       html += `<span class="ctx-badge ctx-neutral">Inside ORB</span>`;
+  }
+
+  // 15m / 1h trend badges
+  if (d.trend_15m) {
+    const tc = d.trend_15m === 'bull' ? 'ctx-bull' : 'ctx-bear';
+    html += `<span class="ctx-badge ${tc}" title="15-minute EMA9 vs EMA21 trend">15m ${d.trend_15m==='bull'?'▲ Bull':'▼ Bear'}</span>`;
+  }
+  if (d.trend_1h) {
+    const tc = d.trend_1h === 'bull' ? 'ctx-bull' : 'ctx-bear';
+    html += `<span class="ctx-badge ${tc}" title="1-hour EMA9 vs EMA21 trend">1h ${d.trend_1h==='bull'?'▲ Bull':'▼ Bear'}</span>`;
+  }
+  if (d.tod_ok === false) {
+    html += `<span class="ctx-badge" style="background:#ffaa0015;color:#ffaa00;border:1px solid #ffaa0044" title="First 15 min or last 5 min of RTH — signals may be choppy">⏸ TOD Filter</span>`;
   }
 
   // PCR chip
