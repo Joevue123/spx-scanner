@@ -8,6 +8,7 @@ from polygon import RESTClient
 from flask import Flask, jsonify
 import threading
 import os
+import itertools
 
 POLYGON_API_KEY = os.getenv("POLYGON_API_KEY")
 DISCORD_WEBHOOK = os.getenv("DISCORD_WEBHOOK")
@@ -344,16 +345,16 @@ async def main():
             print("Fetching market data...")
 
             end = datetime.now(timezone.utc)
-            start = end - timedelta(days=2)
+            start = end - timedelta(days=5)
 
-            aggs = list(client.get_aggs(
+            aggs = list(itertools.islice(client.get_aggs(
                 ticker="SPY",
                 multiplier=1,
                 timespan="minute",
                 from_=start.strftime("%Y-%m-%d"),
                 to=end.strftime("%Y-%m-%d"),
-                limit=300
-            ))
+                limit=500
+            ), 500))
 
             print(f"Fetched candles: {len(aggs)}")
 
@@ -385,7 +386,7 @@ async def main():
 
             df['vwap'] = ta.vwap(df['High'], df['Low'], df['Close'], df['Volume'])
 
-            df = df.fillna(method='bfill')
+            df = df.bfill()
 
             ftfc = (df['Close'] > df['Open']).rolling(30).mean().iloc[-1]
             fvg_active = detect_fvg(df)
@@ -398,12 +399,20 @@ async def main():
             vwap_val     = df['vwap'].iloc[-1]
             st_val       = df['supertrend'].iloc[-1]
 
-            sma20_active = current_price > sma20_val
-            adx_active   = adx_val > 22
-            rsi_active   = 45 < rsi_val < 65
-            ftfc_active  = ftfc > 0.6
-            st_active    = current_price > st_val
-            vwap_active  = current_price > vwap_val
+            import math
+
+            def _valid(v):
+                try:
+                    return v is not None and not math.isnan(float(v))
+                except (TypeError, ValueError):
+                    return False
+
+            sma20_active = _valid(sma20_val) and current_price > sma20_val
+            adx_active   = _valid(adx_val)   and adx_val > 22
+            rsi_active   = _valid(rsi_val)   and 45 < rsi_val < 65
+            ftfc_active  = _valid(ftfc)      and ftfc > 0.6
+            st_active    = _valid(st_val)    and current_price > st_val
+            vwap_active  = _valid(vwap_val)  and current_price > vwap_val
 
             score  = 0
             score += 2 if sma20_active else 0
@@ -419,13 +428,13 @@ async def main():
             gov_status = "NORMAL" if score >= 7 else "REDUCED_RISK"
 
             signals = {
-                "sma20":       {"value": f"{sma20_val:.2f}",             "active": bool(sma20_active), "label": "Above SMA20",  "points": 2},
-                "adx":         {"value": f"{adx_val:.1f}",               "active": bool(adx_active),   "label": "ADX > 22",     "points": 1},
-                "rsi":         {"value": f"{rsi_val:.1f}",               "active": bool(rsi_active),   "label": "RSI 45-65",    "points": 1},
-                "ftfc":        {"value": f"{ftfc * 100:.0f}%",           "active": bool(ftfc_active),  "label": "FTFC > 60%",   "points": 2},
-                "supertrend":  {"value": f"{st_val:.2f}",                "active": bool(st_active),    "label": "SuperTrend",   "points": 1},
+                "sma20":       {"value": f"{sma20_val:.2f}" if _valid(sma20_val) else "--",             "active": bool(sma20_active), "label": "Above SMA20",  "points": 2},
+                "adx":         {"value": f"{adx_val:.1f}" if _valid(adx_val) else "--",               "active": bool(adx_active),   "label": "ADX > 22",     "points": 1},
+                "rsi":         {"value": f"{rsi_val:.1f}" if _valid(rsi_val) else "--",               "active": bool(rsi_active),   "label": "RSI 45-65",    "points": 1},
+                "ftfc":        {"value": f"{ftfc * 100:.0f}%" if _valid(ftfc) else "--",           "active": bool(ftfc_active),  "label": "FTFC > 60%",   "points": 2},
+                "supertrend":  {"value": f"{st_val:.2f}" if _valid(st_val) else "--",                "active": bool(st_active),    "label": "SuperTrend",   "points": 1},
                 "heikin_ashi": {"value": "Bull" if ha_bull else "Bear",  "active": bool(ha_bull),      "label": "Heikin Ashi",  "points": 1},
-                "vwap":        {"value": f"{vwap_val:.2f}",              "active": bool(vwap_active),  "label": "Above VWAP",   "points": 1},
+                "vwap":        {"value": f"{vwap_val:.2f}" if _valid(vwap_val) else "--",              "active": bool(vwap_active),  "label": "Above VWAP",   "points": 1},
                 "fvg":         {"value": "Active" if fvg_active else "None", "active": bool(fvg_active), "label": "FVG Active", "points": 1},
                 "ob":          {"value": "Active" if ob_active  else "None", "active": bool(ob_active),  "label": "Order Block","points": 1},
             }
