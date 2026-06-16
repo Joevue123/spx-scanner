@@ -105,7 +105,7 @@ SIGNAL_CATEGORIES = {
     "above_vah":"LEVELS","below_val":"LEVELS",
     # INST — institutional and smart-money flow
     "block_print":"INST","flow_unusual":"INST","vol_delta":"INST",
-    "vwap_def":"INST",  "tape_read":"INST",
+    "vwap_def":"INST",  "tape_read":"INST",  "obv":"INST",
     # MARKET — macro context, regime, and breadth
     "vix":"MARKET",    "pcr":"MARKET",   "trend_15m":"MARKET",
     "trend_1h":"MARKET","regime_bull":"MARKET","regime_bear":"MARKET",
@@ -1189,6 +1189,8 @@ _blank_ticker = lambda t: {
     # Phase 12
     "vpoc": None, "vah": None, "val": None, "vp_profile": [],
     "vwap_1u": None, "vwap_1d": None, "vwap_2u": None, "vwap_2d": None,
+    # Phase 15
+    "obv_trend": None, "bull_velocity": None, "bear_velocity": None,
     # Phase 14
     "stochrsi_k": None, "stochrsi_d": None,
     # Phase 13
@@ -1507,6 +1509,21 @@ def compute_signals(df_1m, df_5m, ticker=None):
     except Exception:
         pass
 
+    # ── Phase 15: On-Balance Volume (OBV) trend ─────────────────────────────
+    obv_bull_ok = obv_bear_ok = False
+    obv_trend   = None
+    try:
+        obv_s = ta.obv(df['Close'], df['Volume'])
+        if obv_s is not None and len(obv_s) >= 21:
+            obv_ema9  = ta.ema(obv_s, length=9)
+            obv_ema21 = ta.ema(obv_s, length=21)
+            if _valid(obv_ema9.iloc[-1]) and _valid(obv_ema21.iloc[-1]):
+                obv_bull_ok = bool(obv_ema9.iloc[-1] > obv_ema21.iloc[-1])
+                obv_bear_ok = bool(obv_ema9.iloc[-1] < obv_ema21.iloc[-1])
+                obv_trend   = 'bull' if obv_bull_ok else 'bear'
+    except Exception:
+        pass
+
     # ── Time-of-day filter (9:30-9:44 and 15:55-16:00 are suppressed) ────────
     et_now  = datetime.now(timezone.utc).astimezone(_ET)
     in_open = et_now.hour == 9  and et_now.minute < 45     # first 15 min
@@ -1809,6 +1826,7 @@ def compute_signals(df_1m, df_5m, ticker=None):
         "vol_delta":   bs("Vol Delta ▲",      1, delta_bull,              delta_label),
         "vwap_def":    bs("VWAP Bounce",      1, vwap_event == 'bounce',  vwap_def_label),
         "tape_read":   bs("Tape Aggression ↑",1, tape_bull,               tape_label),
+        "obv":         bs("OBV Trend ↑",      1, obv_bull_ok,             obv_trend or "--"),
         # ── Pivot / key levels (Phase 9) ──────────────────────────────────────
         "pivot_bull":  bs("Above Pivot PP",   1, pivot_bull_ok,           pp_str),
         "pdh_break":   bs("PDH Breakout",     1, pdh_break_ok,            pdh_str),
@@ -1868,6 +1886,7 @@ def compute_signals(df_1m, df_5m, ticker=None):
         "vol_delta":   bs("Vol Delta ▼",      1, delta_bear,              delta_label),
         "vwap_def":    bs("VWAP Rejection",   1, vwap_event == 'rejection',vwap_def_label),
         "tape_read":   bs("Tape Aggression ↓",1, tape_bear,               tape_label),
+        "obv":         bs("OBV Trend ↓",      1, obv_bear_ok,             obv_trend or "--"),
         # ── Pivot / key levels (Phase 9) ──────────────────────────────────────
         "pivot_bear":  bs("Below Pivot PP",   1, pivot_bear_ok,           pp_str),
         "pdl_break":   bs("PDL Breakdown",    1, pdl_break_ok,            pdl_str),
@@ -1972,6 +1991,8 @@ def compute_signals(df_1m, df_5m, ticker=None):
         # Phase 14: Stochastic RSI
         "stochrsi_k": stochrsi_k,
         "stochrsi_d": stochrsi_d,
+        # Phase 15: OBV trend
+        "obv_trend": obv_trend,
         # Phase 13: confluence quality breakdown
         "bull_breakdown": bull_breakdown,
         "bear_breakdown": bear_breakdown,
@@ -2205,8 +2226,14 @@ async def scan_ticker(client, ticker, market_open):
     else:
         status = "REDUCED_RISK"
 
-    # History (once per minute)
+    # History (once per minute) + Phase 15 score velocity
     history = dashboard_data[ticker]["history"]
+    # Velocity: delta vs previous recorded entry (before appending current)
+    bull_velocity = bear_velocity = None
+    if len(history) >= 1:
+        ref = history[-1]
+        bull_velocity = int(bull_score) - int(ref.get('bull_score', bull_score))
+        bear_velocity = int(bear_score) - int(ref.get('bear_score', bear_score))
     current_minute = datetime.now().strftime("%H:%M")
     if not history or history[-1]["time"] != current_minute:
         history.append({"time": current_minute, "bull_score": int(bull_score), "bear_score": int(bear_score)})
@@ -2272,6 +2299,10 @@ async def scan_ticker(client, ticker, market_open):
         "vp_profile": result['vp_profile'],
         "vwap_1u": result['vwap_1u'], "vwap_1d": result['vwap_1d'],
         "vwap_2u": result['vwap_2u'], "vwap_2d": result['vwap_2d'],
+        # Phase 15
+        "obv_trend":     result.get('obv_trend'),
+        "bull_velocity": bull_velocity,
+        "bear_velocity": bear_velocity,
         # Phase 14
         "stochrsi_k": result.get('stochrsi_k'),
         "stochrsi_d": result.get('stochrsi_d'),
@@ -2700,30 +2731,62 @@ function fmt(v, prefix='$', dec=2) {
   return prefix + parseFloat(v).toFixed(dec);
 }
 
+// ── Phase 15: velocity + setup grade helpers ─────────────────────────────────
+function velArrow(v) {
+  if (v === null || v === undefined) return '';
+  if (v >= 2)  return `<span style="color:#00ff88;font-size:.65rem;font-weight:bold">↑+${v}</span>`;
+  if (v === 1) return `<span style="color:#88ff88;font-size:.65rem">↑+1</span>`;
+  if (v === 0) return `<span style="color:#444;font-size:.65rem">→</span>`;
+  if (v === -1)return `<span style="color:#ff8888;font-size:.65rem">↓${v}</span>`;
+  return `<span style="color:#ff4444;font-size:.65rem;font-weight:bold">↓${v}</span>`;
+}
+
+function setupGrade(d, dir) {
+  const score = dir === 'bear' ? d.bear_score : d.bull_score;
+  const cq    = dir === 'bear' ? d.bear_cq    : d.bull_cq;
+  const vel   = dir === 'bear' ? d.bear_velocity : d.bull_velocity;
+  const pct   = score / MAX_SCORE;
+  const rising = vel === null || vel >= 0;
+  if (cq === 'HIGH' && pct >= 0.60 && rising) return {g:'A',  c:'#00ff88'};
+  if (cq === 'HIGH' && pct >= 0.50)           return {g:'A−', c:'#44ee88'};
+  if (cq === 'MED'  && pct >= 0.46 && rising) return {g:'B',  c:'#00ffcc'};
+  if (cq === 'MED'  && pct >= 0.34)           return {g:'B−', c:'#44ccaa'};
+  if (cq === 'LOW'  && pct >= 0.30)           return {g:'C',  c:'#ffcc00'};
+  if (pct >= 0.20)                             return {g:'D',  c:'#ff9944'};
+  return {g:'F', c:'#444'};
+}
+
 // ── Ticker summary cards ──────────────────────────────────────────────────────
 function renderTickerRow() {
   const row = document.getElementById('ticker-row');
   row.innerHTML = '';
   for (const ticker of Object.keys(allData)) {
     const d = allData[ticker];
+    const activeDir = d.direction === 'BEAR' ? 'bear' : 'bull';
     const score  = d.direction === 'BEAR' ? d.bear_score : d.bull_score;
     const dirCls = {BULL:'dir-bull',BEAR:'dir-bear',NEUTRAL:'dir-neutral'}[d.direction] || 'dir-starting';
     const gapHtml = d.gap_pct != null
       ? `<span class="ctx-badge ${d.gap_pct>0?'ctx-bull':d.gap_pct<0?'ctx-bear':'ctx-neutral'}">${d.gap_pct>0?'+':''}${d.gap_pct.toFixed(2)}%</span>`
       : '';
+    const grd = setupGrade(d, activeDir);
+    const vel = activeDir === 'bear' ? d.bear_velocity : d.bull_velocity;
     const col = document.createElement('div');
     col.className = 'col-6 col-sm-4 col-md-3 col-xl-2';
     col.innerHTML = `
       <div class="tcrd${ticker===curTicker?' active':''}" onclick="selectTicker('${ticker}')">
         <div class="d-flex justify-content-between align-items-start">
           <span class="t-ticker">${ticker}</span>
-          <span class="t-dir ${dirCls}">${d.direction}</span>
+          <div class="d-flex align-items-center gap-1">
+            <span style="font-size:.68rem;font-weight:bold;color:${grd.c};background:${grd.c}18;border:1px solid ${grd.c}55;padding:0 4px;border-radius:3px;line-height:1.3">${grd.g}</span>
+            <span class="t-dir ${dirCls}">${d.direction}</span>
+          </div>
         </div>
         <div class="t-price">$${d.price.toFixed(2)}</div>
         <div class="t-score d-flex align-items-center gap-1 flex-wrap">
           <span style="color:#00ff88">▲${d.bull_score}</span>
           <span style="color:#ff6666">▼${d.bear_score}</span>
           <span style="color:#444">/${MAX_SCORE}</span>
+          ${velArrow(vel)}
           ${gapHtml}
           ${d.volume_spike?'<span class="vol-spike" style="padding:1px 5px">⚡</span>':''}
         </div>
@@ -2908,6 +2971,11 @@ function renderContextRow() {
     const tapeLabel = d.tape_signal.replace(/_/g,' ').replace(/\\b\\w/g,c=>c.toUpperCase());
     html += `<span class="ctx-badge" style="${instStyle}" title="Tape reading signal"># ${tapeLabel}</span>`;
   }
+  // Phase 15: OBV trend badge
+  if (d.obv_trend) {
+    const obvLabel = d.obv_trend === 'bull' ? '↑ Accum' : '↓ Distrib';
+    html += `<span class="ctx-badge" style="${instStyle}" title="On-Balance Volume EMA9 vs EMA21 — accumulation or distribution trend">OBV ${obvLabel}</span>`;
+  }
 
   // Phase 12: Volume profile + VWAP band badges
   if (d.vpoc != null) {
@@ -2962,7 +3030,7 @@ const CQ_META     = {
   WEAK: {clr:'#555555', lbl:'CQ WEAK'},
 };
 
-function renderCatBreakdown(breakdown, cq) {
+function renderCatBreakdown(breakdown, cq, vel) {
   const el = document.getElementById('cat-breakdown');
   if (!el) return;
   if (!breakdown || !breakdown.active) { el.innerHTML = ''; return; }
@@ -2982,6 +3050,7 @@ function renderCatBreakdown(breakdown, cq) {
   el.innerHTML = `<div style="display:flex;align-items:center;flex-wrap:wrap;gap:4px;padding:3px 0 5px;border-bottom:1px solid #181818;margin-bottom:5px">
     ${bars}
     <span style="margin-left:auto;font-size:.6rem;font-weight:bold;color:${m.clr};border:1px solid ${m.clr}55;padding:1px 6px;border-radius:3px;white-space:nowrap">${m.lbl}</span>
+    ${vel !== null && vel !== undefined ? velArrow(vel) : ''}
   </div>`;
 }
 
@@ -2991,10 +3060,11 @@ function renderSignals() {
   const signals   = curDir === 'bull' ? d.bull_signals   : d.bear_signals;
   const breakdown = curDir === 'bull' ? d.bull_breakdown : d.bear_breakdown;
   const cq        = curDir === 'bull' ? d.bull_cq        : d.bear_cq;
+  const vel       = curDir === 'bull' ? d.bull_velocity  : d.bear_velocity;
   const grid      = document.getElementById('signal-grid');
   grid.innerHTML  = '';
 
-  renderCatBreakdown(breakdown, cq);
+  renderCatBreakdown(breakdown, cq, vel);
 
   // Volume-delta divergence warning banner
   const divEl = document.getElementById('div-warn-banner');
