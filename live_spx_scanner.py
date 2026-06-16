@@ -36,7 +36,7 @@ WATCHLIST             = ["SPY", "QQQ", "IWM", "NVDA", "AAPL"]
 SIGNAL_LOG_FILE       = "/tmp/signal_log.json"
 CSV_LOG_FILE          = "/tmp/signals.csv"
 HISTORY_FILE_TMPL     = "/tmp/score_history_{}.json"
-MAX_SCORE             = 36       # 20 + 5 inst + 2 pivot + 2 candle/regime + 2 fib + 2 volume-profile + 2 stochrsi + 1 session_range
+MAX_SCORE             = 37       # 36 + 1 ema9
 ALERT_COOLDOWN_SECS   = 900
 VOLUME_SPIKE_MULT     = 3.0
 ALERT_SCORE_THRESHOLD = 9
@@ -91,7 +91,7 @@ RS_LAGGER_THRESH      = -0.15   # ticker underperforming SPY by ≥0.15% = RS la
 # ── Phase 13: Signal category mapping ───────────────────────────────────────
 SIGNAL_CATEGORIES = {
     # TECH — core momentum and trend indicators
-    "sma20":"TECH",    "adx":"TECH",     "rsi":"TECH",   "ftfc":"TECH",
+    "sma20":"TECH",    "adx":"TECH",     "rsi":"TECH",   "ftfc":"TECH",  "ema9":"TECH",
     "supertrend":"TECH","heikin_ashi":"TECH","vwap":"TECH","bb":"TECH",
     "macd":"TECH",     "rsi_div":"TECH", "stochrsi":"TECH",
     # PATTERN — price action and candle structure
@@ -1190,6 +1190,8 @@ _blank_ticker = lambda t: {
     # Phase 12
     "vpoc": None, "vah": None, "val": None, "vp_profile": [],
     "vwap_1u": None, "vwap_1d": None, "vwap_2u": None, "vwap_2d": None,
+    # Phase 17
+    "ema9_1m": None, "range_vs_atr": None, "vwap_dist_atr": None,
     # Phase 16
     "session_open": None, "session_high": None, "session_low": None,
     "range_pos_pct": None, "session_chg_pct": None,
@@ -1475,6 +1477,15 @@ def compute_signals(df_1m, df_5m, ticker=None):
     except Exception:
         pass
 
+    # ── Phase 17: EMA9 on 1m ─────────────────────────────────────────────────
+    ema9_1m_val = None
+    try:
+        ema9_s = ta.ema(df['Close'], length=9)
+        if ema9_s is not None and _valid(ema9_s.iloc[-1]):
+            ema9_1m_val = round(float(ema9_s.iloc[-1]), 2)
+    except Exception:
+        pass
+
     # ── 15m trend: EMA(9) vs EMA(21) ─────────────────────────────────────────
     trend_15m = None
     try:
@@ -1615,6 +1626,17 @@ def compute_signals(df_1m, df_5m, ticker=None):
             session_range_bear = range_pos_pct >= 75
         if session_open and session_open > 0:
             session_chg_pct = round((price - session_open) / session_open * 100, 2)
+    except Exception:
+        pass
+
+    # ── Phase 17: Range/VWAP analysis (uses existing atr_val + vwap_val) ──────
+    range_vs_atr  = None
+    vwap_dist_atr = None
+    try:
+        if session_high is not None and session_low is not None and _valid(atr_val) and atr_val > 0:
+            range_vs_atr = round((session_high - session_low) / atr_val, 2)
+        if _valid(vwap_val) and _valid(atr_val) and atr_val > 0:
+            vwap_dist_atr = round((price - vwap_val) / atr_val, 2)
     except Exception:
         pass
 
@@ -1827,8 +1849,13 @@ def compute_signals(df_1m, df_5m, ticker=None):
     )
     _srsi_val = f"K:{stochrsi_k} D:{stochrsi_d}" if stochrsi_k is not None else "--"
 
+    ema9_b = _valid(ema9_1m_val) and price    > ema9_1m_val
+    ema9_r = _valid(ema9_1m_val) and price    < ema9_1m_val
+    ema9_lbl = f"{ema9_1m_val:.2f}" if ema9_1m_val is not None else "--"
+
     bull = {
         "sma20":       bs("SMA20 MTF",      2, sma_b1 and sma_b5,      f"{sma20_1m:.2f}" if _valid(sma20_1m) else "--",  sma_b1, sma_b5),
+        "ema9":        bs("EMA9 ↑",           1, ema9_b,                 ema9_lbl),
         "adx":         bs("ADX Bull",        1, adx_b,                  f"{adx_val:.1f}"  if _valid(adx_val)  else "--"),
         "rsi":         bs("RSI 45-65",       1, rsi_b,                  f"{rsi_1m:.1f}"   if _valid(rsi_1m)   else "--"),
         "ftfc":        bs("FTFC MTF",        2, ftfc_b1 and ftfc_b5,    f"{ftfc_1m*100:.0f}%" if _valid(ftfc_1m) else "--", ftfc_b1, ftfc_b5),
@@ -1892,6 +1919,7 @@ def compute_signals(df_1m, df_5m, ticker=None):
 
     bear = {
         "sma20":       bs("SMA20 MTF",       2, sma_r1 and sma_r5,     f"{sma20_1m:.2f}" if _valid(sma20_1m) else "--",  sma_r1, sma_r5),
+        "ema9":        bs("EMA9 ↓",            1, ema9_r,                ema9_lbl),
         "adx":         bs("ADX Bear",         1, adx_r,                 f"{adx_val:.1f}"  if _valid(adx_val)  else "--"),
         "rsi":         bs("RSI 35-55",        1, rsi_r,                 f"{rsi_1m:.1f}"   if _valid(rsi_1m)   else "--"),
         "ftfc":        bs("FTFC Bear MTF",    2, ftfc_r1 and ftfc_r5,   f"{(1-ftfc_1m)*100:.0f}%" if _valid(ftfc_1m) else "--", ftfc_r1, ftfc_r5),
@@ -2024,6 +2052,10 @@ def compute_signals(df_1m, df_5m, ticker=None):
         # Phase 14: Stochastic RSI
         "stochrsi_k": stochrsi_k,
         "stochrsi_d": stochrsi_d,
+        # Phase 17: EMA9 + range/VWAP analysis
+        "ema9_1m":      ema9_1m_val,
+        "range_vs_atr": range_vs_atr,
+        "vwap_dist_atr":vwap_dist_atr,
         # Phase 16: session range
         "session_open":    session_open,
         "session_high":    session_high,
@@ -2351,6 +2383,10 @@ async def scan_ticker(client, ticker, market_open):
         "vp_profile": result['vp_profile'],
         "vwap_1u": result['vwap_1u'], "vwap_1d": result['vwap_1d'],
         "vwap_2u": result['vwap_2u'], "vwap_2d": result['vwap_2d'],
+        # Phase 17
+        "ema9_1m":      result.get('ema9_1m'),
+        "range_vs_atr": result.get('range_vs_atr'),
+        "vwap_dist_atr":result.get('vwap_dist_atr'),
         # Phase 16: session range + gamma walls
         "session_open":      result.get('session_open'),
         "session_high":      result.get('session_high'),
@@ -2816,6 +2852,25 @@ function setupGrade(d, dir) {
   return {g:'F', c:'#444'};
 }
 
+// ── Phase 17: Score sparkline ─────────────────────────────────────────────────
+function sparklineSvg(history, w, h) {
+  w = w || 88; h = h || 20;
+  if (!history || history.length < 2) return '';
+  const n = history.length;
+  function toPath(getter, color) {
+    const pts = history.map((entry, i) => {
+      const x = Math.round(i / (n - 1) * w);
+      const y = Math.round(h - (getter(entry) / MAX_SCORE) * h);
+      return (i === 0 ? 'M' : 'L') + x + ',' + Math.max(0, Math.min(h, y));
+    }).join(' ');
+    return `<path d="${pts}" fill="none" stroke="${color}" stroke-width="1.4" stroke-linecap="round"/>`;
+  }
+  return `<svg width="${w}" height="${h}" style="display:block;overflow:visible">
+    ${toPath(e => e.bear_score, '#ff444455')}
+    ${toPath(e => e.bull_score, '#00ff8877')}
+  </svg>`;
+}
+
 // ── Ticker summary cards ──────────────────────────────────────────────────────
 function renderTickerRow() {
   const row = document.getElementById('ticker-row');
@@ -2860,6 +2915,7 @@ function renderTickerRow() {
         <div class="bar-wrap mt-1">
           <div class="bar" style="width:${Math.min(score/MAX_SCORE*100,100)}%;background:${scoreColor(score)}"></div>
         </div>
+        <div style="margin-top:3px;opacity:.75">${sparklineSvg(d.history)}</div>
       </div>`;
     row.appendChild(col);
   }
@@ -3080,6 +3136,24 @@ function renderContextRow() {
     const rCls   = d.range_pos_pct <= 25 ? 'ctx-bull' : d.range_pos_pct >= 75 ? 'ctx-bear' : 'ctx-neutral';
     const chgStr = d.session_chg_pct != null ? ` ${d.session_chg_pct >= 0 ? '+' : ''}${d.session_chg_pct.toFixed(2)}%` : '';
     html += `<span class="ctx-badge ${rCls}" title="Session range: H $${d.session_high.toFixed(2)} / L $${d.session_low.toFixed(2)} (±$${rng.toFixed(2)}) — price at ${d.range_pos_pct.toFixed(0)}% of today&#39;s range${chgStr ? '; today ' + chgStr : ''}">Range ${d.range_pos_pct.toFixed(0)}%${chgStr}</span>`;
+  }
+
+  // Phase 17: VWAP distance + range expansion badges
+  if (d.vwap_dist_atr != null) {
+    const vSign = d.vwap_dist_atr >= 0 ? '+' : '';
+    const vCls  = Math.abs(d.vwap_dist_atr) < 0.4 ? 'ctx-neutral' : d.vwap_dist_atr > 0 ? 'ctx-bull' : 'ctx-bear';
+    const vWarn = Math.abs(d.vwap_dist_atr) > 2.0 ? ' ⚠ Extended' : '';
+    html += `<span class="ctx-badge ${vCls}" title="Distance from VWAP in ATR units — >2 means price is extended from VWAP">VWAP ${vSign}${d.vwap_dist_atr.toFixed(1)}ATR${vWarn}</span>`;
+  }
+  if (d.range_vs_atr != null) {
+    const compLabel = d.range_vs_atr < 0.8 ? ' ⚡ Coiling' : d.range_vs_atr < 1.2 ? '' : d.range_vs_atr > 2.5 ? ' Extended' : '';
+    const rCls = d.range_vs_atr < 1.0 ? 'ctx-bull' : 'ctx-neutral';
+    html += `<span class="ctx-badge ${rCls}" title="Today&#39;s H-L range vs ATR. <1× = range compressed (coiling, breakout setup). >2× = expanded (momentum day).">Rng ×${d.range_vs_atr.toFixed(1)}ATR${compLabel}</span>`;
+  }
+  if (d.ema9_1m != null && d.price != null) {
+    const aboveEma = d.price > d.ema9_1m;
+    const eCls = aboveEma ? 'ctx-bull' : 'ctx-bear';
+    html += `<span class="ctx-badge ${eCls}" title="EMA9 on 1-minute chart — reactive short-term trend filter">EMA9 $${d.ema9_1m.toFixed(2)} ${aboveEma ? '▲' : '▼'}</span>`;
   }
 
   // Phase 16: Gamma walls (call wall = nearest high-OI call above price; put wall = nearest high-OI put below price)
