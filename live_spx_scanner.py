@@ -3033,6 +3033,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     <button class="sound-btn on" id="sound-btn" onclick="toggleSound()">🔔 Sound ON</button>
     <button class="sound-btn" id="notif-btn" onclick="requestNotifPermission()" title="Enable browser push notifications">🔔 Enable Alerts</button>
     <a href="/api/download-csv" class="sound-btn" style="text-decoration:none;font-size:.72rem" title="Download today&#39;s signal log as CSV">⬇ CSV</a>
+    <a href="/backtest" class="sound-btn" style="text-decoration:none;font-size:.72rem" title="60-day walk-forward backtest">⚡ Backtest</a>
   </div>
 
   <!-- Economic Event Banner (today's high-impact events) -->
