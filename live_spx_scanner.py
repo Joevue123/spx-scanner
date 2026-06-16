@@ -3552,8 +3552,8 @@ function renderRevPanel() {
   if (d.vwap_val) {
     const vd = d.vwap_dist_atr;
     const distStr = vd!=null ? " | Dist: "+(vd>0?"+":"")+vd.toFixed(2)+"xATR" : "";
-    html += "<div style=\"margin-top:8px;font-size:.72rem;color:#555\">" +
-      "VWAP: $" + d.vwap_val.toFixed(2) + distStr + "</div>";
+    html += '<div style="margin-top:8px;font-size:.72rem;color:#555">' +
+      'VWAP: $' + d.vwap_val.toFixed(2) + distStr + '</div>';
   }
   panel.innerHTML = html;
 }
