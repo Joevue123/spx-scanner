@@ -36,7 +36,7 @@ WATCHLIST             = ["SPY", "QQQ", "IWM", "NVDA", "AAPL"]
 SIGNAL_LOG_FILE       = "/tmp/signal_log.json"
 CSV_LOG_FILE          = "/tmp/signals.csv"
 HISTORY_FILE_TMPL     = "/tmp/score_history_{}.json"
-MAX_SCORE             = 31       # 20 + 5 institutional + 2 pivot + 2 candlestick/regime + 2 fib signals per direction
+MAX_SCORE             = 33       # 20 + 5 inst + 2 pivot + 2 candle/regime + 2 fib + 2 volume-profile signals per direction
 ALERT_COOLDOWN_SECS   = 900
 VOLUME_SPIKE_MULT     = 3.0
 ALERT_SCORE_THRESHOLD = 9
@@ -70,6 +70,10 @@ VOL_DELTA_LOOKBACK    = 5       # bars to compute cumulative volume delta over
 # Optional paid-API upgrade paths (set env vars to enable)
 POLYGON_TIER          = os.getenv("POLYGON_TIER",        "free")  # "paid" → v3/trades
 UNUSUAL_WHALES_KEY    = os.getenv("UNUSUAL_WHALES_KEY",  "")      # enables UW sweeps API
+
+# ── Phase 12: Volume profile config ─────────────────────────────────────────
+VP_BINS               = 40       # price bins for intraday volume profile
+VP_VALUE_AREA_PCT     = 0.70     # value area = bins containing 70% of session volume
 
 # ── Phase 11: Fibonacci config ───────────────────────────────────────────────
 FIB_LOOKBACK          = 200      # 1m bars to scan for swing high/low (~3-4 RTH hours)
@@ -347,6 +351,105 @@ def _compute_max_pain(calls, puts):
         return float(best)
     except Exception:
         return None
+
+
+# ====================== VOLUME PROFILE & VWAP BANDS (Phase 12) ============
+
+def compute_volume_profile(df_1m, n_bins=None):
+    """
+    Intraday volume profile from today's RTH 1m bars.
+
+    Bins the session's price range into VP_BINS buckets, assigns each bar's
+    volume to the bin whose midpoint matches the bar's typical price, then:
+      VPOC — price level with the highest volume (highest-conviction S/R)
+      VAH  — value area high: upper boundary of the 70%-volume zone
+      VAL  — value area low:  lower boundary of the 70%-volume zone
+    Price inside VAL–VAH = "fair value"; breakouts above VAH or below VAL
+    signal an expansion move with less overhead/underlying resistance.
+    Returns a compact profile list [[price, volume], ...] for the UI chart.
+    """
+    if n_bins is None:
+        n_bins = VP_BINS
+    if df_1m is None or len(df_1m) < 5:
+        return {}
+    last_day = df_1m['date'].iloc[-1]
+    today = df_1m[df_1m['date'] == last_day]
+    if len(today) < 5:
+        return {}
+
+    lo = float(today['Low'].min())
+    hi = float(today['High'].max())
+    if hi - lo < 1e-9:
+        return {}
+
+    # Assign each bar's volume to the bin of its typical price (fast, vectorised)
+    typical = ((today['High'] + today['Low'] + today['Close']) / 3).values
+    vols    = today['Volume'].fillna(0).astype(float).values
+    bin_size = (hi - lo) / n_bins
+    profile  = {}
+    for tp, vol in zip(typical, vols):
+        b = min(int((tp - lo) / bin_size), n_bins - 1)
+        pc = round(lo + (b + 0.5) * bin_size, 2)
+        profile[pc] = profile.get(pc, 0) + vol
+
+    if not profile:
+        return {}
+
+    vpoc = max(profile, key=profile.get)
+    sorted_p = sorted(profile.keys())
+    vi = sorted_p.index(vpoc)
+
+    # Expand value area from VPOC outward until VP_VALUE_AREA_PCT of volume is captured
+    total_vol  = sum(profile.values())
+    target_vol = total_vol * VP_VALUE_AREA_PCT
+    lo_i, hi_i, area_vol = vi, vi, profile[vpoc]
+    lo_ptr, hi_ptr = vi - 1, vi + 1
+    while area_vol < target_vol and (lo_ptr >= 0 or hi_ptr < len(sorted_p)):
+        v_lo = profile.get(sorted_p[lo_ptr], 0) if lo_ptr >= 0 else 0
+        v_hi = profile.get(sorted_p[hi_ptr], 0) if hi_ptr < len(sorted_p) else 0
+        if v_hi >= v_lo and hi_ptr < len(sorted_p):
+            area_vol += v_hi; hi_i = hi_ptr; hi_ptr += 1
+        elif lo_ptr >= 0:
+            area_vol += v_lo; lo_i = lo_ptr; lo_ptr -= 1
+        else:
+            area_vol += v_hi; hi_i = hi_ptr; hi_ptr += 1
+
+    profile_list = [[p, int(v)] for p, v in sorted(profile.items())]
+    return {
+        'vpoc':    round(vpoc, 2),
+        'vah':     round(sorted_p[hi_i], 2),
+        'val':     round(sorted_p[lo_i], 2),
+        'profile': profile_list,
+    }
+
+
+def compute_vwap_bands(today_df, vwap_val):
+    """
+    VWAP standard-deviation bands: VWAP ± 1σ and ± 2σ.
+    σ is the volume-weighted standard deviation of the typical price from VWAP.
+    Price at ±2σ is statistically extreme (~5% of session time) and often
+    signals mean-reversion opportunities back toward VWAP.
+    """
+    if today_df is None or len(today_df) < 5 or not _valid(vwap_val):
+        return {}
+    try:
+        typical   = (today_df['High'] + today_df['Low'] + today_df['Close']) / 3
+        vol       = today_df['Volume'].fillna(0).astype(float)
+        total_vol = float(vol.sum())
+        if total_vol <= 0:
+            return {}
+        variance = float((vol * (typical - vwap_val) ** 2).sum() / total_vol)
+        sigma = variance ** 0.5
+        if sigma <= 0:
+            return {}
+        return {
+            'vwap_1u': round(vwap_val + sigma,     2),
+            'vwap_1d': round(vwap_val - sigma,     2),
+            'vwap_2u': round(vwap_val + 2 * sigma, 2),
+            'vwap_2d': round(vwap_val - 2 * sigma, 2),
+        }
+    except Exception:
+        return {}
 
 
 # ====================== FIBONACCI & RELATIVE STRENGTH (Phase 11) ==========
@@ -1044,6 +1147,9 @@ _blank_ticker = lambda t: {
     "fib_236": None, "fib_382": None, "fib_500": None, "fib_618": None, "fib_786": None,
     "fib_at_zone": False, "fib_zone_level": None, "fib_zone_val": None,
     "rs_vs_spy": None, "rs_signal": None,
+    # Phase 12
+    "vpoc": None, "vah": None, "val": None, "vp_profile": [],
+    "vwap_1u": None, "vwap_1d": None, "vwap_2u": None, "vwap_2d": None,
     "bull_signals": {},
     "bear_signals": {},
     "history":      load_history(t),
@@ -1546,6 +1652,36 @@ def compute_signals(df_1m, df_5m, ticker=None):
         else:
             fib_label = "No zone"
 
+    # ── Phase 12: Volume profile + VWAP bands ─────────────────────────────────
+    vp_result   = compute_volume_profile(df_1m)
+    vpoc        = vp_result.get('vpoc')
+    vah         = vp_result.get('vah')
+    val         = vp_result.get('val')
+    vp_profile  = vp_result.get('profile', [])
+
+    vwap_bands  = compute_vwap_bands(_today_raw if len(_today_raw) >= 5 else df_1m.tail(10), vwap_val)
+    vwap_1u     = vwap_bands.get('vwap_1u')
+    vwap_1d     = vwap_bands.get('vwap_1d')
+    vwap_2u     = vwap_bands.get('vwap_2u')
+    vwap_2d     = vwap_bands.get('vwap_2d')
+
+    vpoc_bull_ok  = bool(vpoc and price > vpoc)
+    vpoc_bear_ok  = bool(vpoc and price < vpoc)
+    above_vah_ok  = bool(vah  and price > vah)
+    below_val_ok  = bool(val  and price < val)
+
+    vpoc_str = f"${vpoc:.2f}" if vpoc else "No data"
+    if vah and val and price:
+        if price > vah:
+            va_pos = f"Above VAH ${vah:.2f}"
+        elif price < val:
+            va_pos = f"Below VAL ${val:.2f}"
+        else:
+            pct_in = round((price - val) / max(vah - val, 0.01) * 100)
+            va_pos = f"In VA {pct_in}%"
+    else:
+        va_pos = "No data"
+
     # ── Signal builder helper ──────────────────────────────────────────────────
     def bs(label, pts, active, value, tf1=None, tf5=None):
         d = {"label": label, "points": pts, "active": bool(active), "value": value}
@@ -1607,6 +1743,9 @@ def compute_signals(df_1m, df_5m, ticker=None):
         # ── Fibonacci zones (Phase 11) ─────────────────────────────────────────
         "fib_support": bs("Fib Support",      1, fib_support_ok,          fib_label),
         "fib_ext":     bs("Fib Extension ↑",  1, bool(fib_data.get('swing_high') and price > fib_data['swing_high']), f">{fib_data.get('swing_high','--')}"),
+        # ── Volume profile (Phase 12) ──────────────────────────────────────────
+        "vpoc_bull":   bs("Above VPOC",       1, vpoc_bull_ok,            vpoc_str),
+        "above_vah":   bs("Above VAH ↑",      1, above_vah_ok,            va_pos),
     }
     bull_score = sum(s['points'] for s in bull.values() if s['active'])
 
@@ -1662,6 +1801,9 @@ def compute_signals(df_1m, df_5m, ticker=None):
         # ── Fibonacci zones (Phase 11) ─────────────────────────────────────────
         "fib_resist":  bs("Fib Resistance",   1, fib_resist_ok,           fib_label),
         "fib_ext":     bs("Fib Extension ↓",  1, bool(fib_data.get('swing_low') and price < fib_data['swing_low']), f"<{fib_data.get('swing_low','--')}"),
+        # ── Volume profile (Phase 12) ──────────────────────────────────────────
+        "vpoc_bear":   bs("Below VPOC",       1, vpoc_bear_ok,            vpoc_str),
+        "below_val":   bs("Below VAL ↓",      1, below_val_ok,            va_pos),
     }
     bear_score = sum(s['points'] for s in bear.values() if s['active'])
 
@@ -1720,6 +1862,10 @@ def compute_signals(df_1m, df_5m, ticker=None):
         "fib_500": fib_data.get('fib_500'), "fib_618": fib_data.get('fib_618'),
         "fib_786": fib_data.get('fib_786'),
         "fib_at_zone": fib_at_zone, "fib_zone_level": fib_lv_name, "fib_zone_val": fib_lv_val,
+        # Phase 12
+        "vpoc": vpoc, "vah": vah, "val": val, "vp_profile": vp_profile,
+        "vwap_1u": vwap_1u, "vwap_1d": vwap_1d,
+        "vwap_2u": vwap_2u, "vwap_2d": vwap_2d,
     }
 
 
@@ -2010,6 +2156,11 @@ async def scan_ticker(client, ticker, market_open):
         "fib_at_zone":    result['fib_at_zone'],
         "fib_zone_level": result['fib_zone_level'],
         "fib_zone_val":   result['fib_zone_val'],
+        # Phase 12
+        "vpoc": result['vpoc'], "vah": result['vah'], "val": result['val'],
+        "vp_profile": result['vp_profile'],
+        "vwap_1u": result['vwap_1u'], "vwap_1d": result['vwap_1d'],
+        "vwap_2u": result['vwap_2u'], "vwap_2d": result['vwap_2d'],
         # PCR from options_data (updated by fetch_options_flow, not per-scan)
         "pcr":          options_data.get(ticker, {}).get("pcr"),
         "pcr_oi":       options_data.get(ticker, {}).get("pcr_oi"),
@@ -2628,6 +2779,31 @@ function renderContextRow() {
     html += `<span class="ctx-badge" style="${instStyle}" title="Tape reading signal"># ${tapeLabel}</span>`;
   }
 
+  // Phase 12: Volume profile + VWAP band badges
+  if (d.vpoc != null) {
+    const aboveVpoc = d.price > d.vpoc;
+    const vCls = aboveVpoc ? 'ctx-bull' : 'ctx-bear';
+    html += `<span class="ctx-badge ${vCls}" title="Volume Point of Control — highest-volume price level this session">VPOC $${d.vpoc.toFixed(2)} ${aboveVpoc?'▲':'▼'}</span>`;
+  }
+  if (d.vah != null && d.val != null) {
+    if (d.price > d.vah)
+      html += `<span class="ctx-badge ctx-bull" title="Price above Value Area High — breakout expansion">↑ VAH $${d.vah.toFixed(2)}</span>`;
+    else if (d.price < d.val)
+      html += `<span class="ctx-badge ctx-bear" title="Price below Value Area Low — breakdown expansion">↓ VAL $${d.val.toFixed(2)}</span>`;
+    else {
+      const pct = Math.round((d.price - d.val) / Math.max(d.vah - d.val, 0.01) * 100);
+      html += `<span class="ctx-badge ctx-neutral" title="Inside Value Area (70% volume zone) — fair value range">VA ${pct}% ↔ $${d.val.toFixed(2)}–$${d.vah.toFixed(2)}</span>`;
+    }
+  }
+  if (d.vwap_2u != null && d.price > d.vwap_2u)
+    html += `<span class="ctx-badge ctx-bear" title="Price above VWAP +2σ — statistically extreme, mean-reversion risk">⚠ VWAP +2σ $${d.vwap_2u.toFixed(2)}</span>`;
+  else if (d.vwap_2d != null && d.price < d.vwap_2d)
+    html += `<span class="ctx-badge ctx-bull" title="Price below VWAP -2σ — statistically extreme, mean-reversion opportunity">⚠ VWAP -2σ $${d.vwap_2d.toFixed(2)}</span>`;
+  else if (d.vwap_1u != null && d.vwap_1d != null) {
+    const vwapBandCls = d.price > d.vwap_1u ? 'ctx-bull' : d.price < d.vwap_1d ? 'ctx-bear' : 'ctx-neutral';
+    html += `<span class="ctx-badge ${vwapBandCls}" title="VWAP bands (1σ: $${d.vwap_1d.toFixed(2)}–$${d.vwap_1u.toFixed(2)})">VWAP ±1σ</span>`;
+  }
+
   // Phase 11: Fibonacci zone + RS badges
   if (d.fib_at_zone && d.fib_zone_level && d.fib_zone_val != null) {
     const aboveFib = d.price >= d.fib_zone_val;
@@ -2983,7 +3159,28 @@ function renderAnalytics() {
         ${lvlRow('Swing Lo', kd.fib_swing_low,  '#ffaaaa', kd.fib_at_zone && kd.price <= kd.fib_zone_val)}
       </table>
     </div>
-    <div class="col-12 col-md-4">
+    <div class="col-12 col-md-3">
+      <div style="font-size:.7rem;color:#555;text-transform:uppercase;letter-spacing:.5px;margin-bottom:4px">Volume Profile</div>
+      <table style="width:100%;border-collapse:collapse;font-size:.75rem">
+        ${kd.vpoc != null ? `
+        <tr style="background:#111"><td style="color:#ffd700;padding:2px 6px;font-weight:600">VPOC</td><td style="text-align:right;color:#ffd700;font-weight:600;padding:2px 6px">$${kd.vpoc.toFixed(2)}</td></tr>
+        <tr><td style="color:#555;padding:2px 6px">VAH</td><td style="text-align:right;color:#00aa44;padding:2px 6px">$${kd.vah.toFixed(2)}</td></tr>
+        <tr><td style="color:#555;padding:2px 6px">VAL</td><td style="text-align:right;color:#ff8888;padding:2px 6px">$${kd.val.toFixed(2)}</td></tr>
+        ` : '<tr><td colspan="2" style="color:#333;padding:4px 6px;font-size:.7rem">No data (market closed)</td></tr>'}
+        ${kd.vwap_2u != null ? `
+        <tr><td style="color:#555;padding:2px 6px">+2σ</td><td style="text-align:right;color:#ff9966;padding:2px 6px">$${kd.vwap_2u.toFixed(2)}</td></tr>
+        <tr><td style="color:#555;padding:2px 6px">+1σ</td><td style="text-align:right;color:#cc7744;padding:2px 6px">$${kd.vwap_1u.toFixed(2)}</td></tr>
+        ` : ''}
+        ${kd.price != null && kd.vwap_val != null ? `
+        <tr style="background:#0d0d0d;border-top:1px solid #222"><td style="color:#00ffcc;padding:3px 6px;font-weight:600">VWAP</td><td style="text-align:right;color:#00ffcc;font-weight:600;padding:3px 6px">$${(kd.vwap_1u && kd.vwap_1d ? ((kd.vwap_1u+kd.vwap_1d)/2).toFixed(2) : '--')}</td></tr>
+        ` : ''}
+        ${kd.vwap_1d != null ? `
+        <tr><td style="color:#555;padding:2px 6px">-1σ</td><td style="text-align:right;color:#4477cc;padding:2px 6px">$${kd.vwap_1d.toFixed(2)}</td></tr>
+        <tr><td style="color:#555;padding:2px 6px">-2σ</td><td style="text-align:right;color:#6699ff;padding:2px 6px">$${kd.vwap_2d.toFixed(2)}</td></tr>
+        ` : ''}
+      </table>
+    </div>
+    <div class="col-12 col-md-3">
       <div style="font-size:.7rem;color:#555;text-transform:uppercase;letter-spacing:.5px;margin-bottom:4px">Reference</div>
       <table style="width:100%;border-collapse:collapse;font-size:.75rem">
         ${lvlRow('Prev High',  kd.prev_high,  '#aaa', false)}
@@ -3003,6 +3200,32 @@ function renderAnalytics() {
       </table>
     </div>
   </div>
+  ${kd.vp_profile && kd.vp_profile.length > 0 ? (() => {
+    const profile = kd.vp_profile;
+    const maxVol  = Math.max(...profile.map(b => b[1]));
+    const vpoc    = kd.vpoc, vah = kd.vah, val = kd.val, cur = kd.price;
+    const rows = [...profile].reverse().map(([p, v]) => {
+      const pct     = Math.round(v / maxVol * 100);
+      const isVpoc  = vpoc  != null && Math.abs(p - vpoc) < 0.01;
+      const inVA    = vah   != null && val != null && p >= val && p <= vah;
+      const isCur   = cur   != null && Math.abs(p - cur) < (profile.length > 1 ? Math.abs(profile[1][0] - profile[0][0]) * 0.6 : 0.5);
+      const barClr  = isVpoc ? '#ffd700' : inVA ? '#1a4488' : '#0d2233';
+      const lblClr  = isVpoc ? '#ffd700' : inVA ? '#4488bb' : '#333';
+      return `<div style="display:flex;align-items:center;height:5px;margin-bottom:1px;gap:2px">
+        <div style="width:46px;text-align:right;font-size:.55rem;color:${lblClr};flex-shrink:0">${isVpoc?'★':isCur?'►':''} $${p.toFixed(1)}</div>
+        <div style="flex:1;background:#060606;border-radius:1px;position:relative">
+          <div style="width:${pct}%;height:5px;background:${barClr};border-radius:1px;transition:width .3s"></div>
+        </div>
+      </div>`;
+    }).join('');
+    return `<div style="margin-top:8px">
+      <div style="font-size:.7rem;color:#555;text-transform:uppercase;letter-spacing:.5px;margin-bottom:4px">
+        Volume Profile — today's session
+        <span style="float:right;color:#666">VPOC $${vpoc?.toFixed(2)||'--'} | VA $${val?.toFixed(2)||'--'}–$${vah?.toFixed(2)||'--'}</span>
+      </div>
+      <div style="background:#050505;border:1px solid #111;border-radius:4px;padding:4px 6px;max-height:200px;overflow-y:auto">${rows}</div>
+    </div>`;
+  })() : ''}
 </div>` : '';
 
   panel.innerHTML = keyLevelsHtml + tradesHtml + `
