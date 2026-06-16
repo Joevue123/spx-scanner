@@ -36,7 +36,7 @@ WATCHLIST             = ["SPY", "QQQ", "IWM", "NVDA", "AAPL"]
 SIGNAL_LOG_FILE       = "/tmp/signal_log.json"
 CSV_LOG_FILE          = "/tmp/signals.csv"
 HISTORY_FILE_TMPL     = "/tmp/score_history_{}.json"
-MAX_SCORE             = 39       # 37 + 1 ema50 + 1 pm_break
+MAX_SCORE             = 41       # 39 + 1 ema_cross + 1 consec_bars
 ALERT_COOLDOWN_SECS   = 900
 VOLUME_SPIKE_MULT     = 3.0
 ALERT_SCORE_THRESHOLD = 9
@@ -91,7 +91,9 @@ RS_LAGGER_THRESH      = -0.15   # ticker underperforming SPY by ≥0.15% = RS la
 # ── Phase 13: Signal category mapping ───────────────────────────────────────
 SIGNAL_CATEGORIES = {
     # TECH — core momentum and trend indicators
-    "sma20":"TECH",    "adx":"TECH",     "rsi":"TECH",   "ftfc":"TECH",  "ema9":"TECH",  "ema50":"TECH",
+    "sma20":"TECH",    "adx":"TECH",     "rsi":"TECH",   "ftfc":"TECH",
+    "ema9":"TECH",     "ema50":"TECH",   "ema_cross":"TECH",
+    "consec_bars":"PATTERN",
     "supertrend":"TECH","heikin_ashi":"TECH","vwap":"TECH","bb":"TECH",
     "macd":"TECH",     "rsi_div":"TECH", "stochrsi":"TECH",
     # PATTERN — price action and candle structure
@@ -1481,11 +1483,13 @@ def compute_signals(df_1m, df_5m, ticker=None, pm_high=None, pm_low=None):
         pass
 
     # ── Phase 17: EMA9 on 1m ─────────────────────────────────────────────────
-    ema9_1m_val = None
+    ema9_1m_val = ema9_1m_prev = None
     try:
         ema9_s = ta.ema(df['Close'], length=9)
         if ema9_s is not None and _valid(ema9_s.iloc[-1]):
             ema9_1m_val = round(float(ema9_s.iloc[-1]), 2)
+        if ema9_s is not None and len(ema9_s) >= 2 and _valid(ema9_s.iloc[-2]):
+            ema9_1m_prev = round(float(ema9_s.iloc[-2]), 2)
     except Exception:
         pass
 
@@ -1620,8 +1624,9 @@ def compute_signals(df_1m, df_5m, ticker=None, pm_high=None, pm_low=None):
         rng = 0
 
     # ── Snapshot values ───────────────────────────────────────────────────────
-    price    = float(df['Close'].iloc[-1])
-    sma20_1m = float(df['sma20'].iloc[-1])
+    price     = float(df['Close'].iloc[-1])
+    sma20_1m  = float(df['sma20'].iloc[-1])
+    sma20_1m_prev = float(df['sma20'].iloc[-2]) if len(df) >= 2 and _valid(df['sma20'].iloc[-2]) else None
     rsi_1m   = float(df['rsi'].iloc[-1])
     adx_val  = float(df['adx'].iloc[-1])
     dmp_val  = float(df['dmp'].iloc[-1])
@@ -1659,6 +1664,39 @@ def compute_signals(df_1m, df_5m, ticker=None, pm_high=None, pm_low=None):
     fvg_dir    = detect_fvg(df)
     ob_dir     = detect_order_blocks(df)
     rsi_div    = detect_rsi_divergence(df)
+
+    # ── Phase 19: EMA cross + consecutive candles ─────────────────────────────
+    ema_cross_bull = ema_cross_bear = False
+    try:
+        if (ema9_1m_val is not None and sma20_1m is not None and
+                ema9_1m_prev is not None and sma20_1m_prev is not None):
+            ema_cross_bull = ema9_1m_val > sma20_1m and ema9_1m_prev <= sma20_1m_prev
+            ema_cross_bear = ema9_1m_val < sma20_1m and ema9_1m_prev >= sma20_1m_prev
+    except Exception:
+        pass
+
+    consec_bull = consec_bear = False
+    consec_count = 0
+    try:
+        tail = df[['Open', 'Close']].tail(5)
+        bull_streak = bear_streak = 0
+        for i in range(len(tail) - 1, -1, -1):
+            row = tail.iloc[i]
+            if float(row['Close']) > float(row['Open']):
+                bull_streak += 1
+            else:
+                break
+        for i in range(len(tail) - 1, -1, -1):
+            row = tail.iloc[i]
+            if float(row['Close']) < float(row['Open']):
+                bear_streak += 1
+            else:
+                break
+        consec_bull  = bull_streak >= 3
+        consec_bear  = bear_streak >= 3
+        consec_count = max(bull_streak, bear_streak)
+    except Exception:
+        pass
 
     vol_avg   = float(df['Volume'].rolling(20).mean().iloc[-1])
     vol_cur   = float(df['Volume'].iloc[-1])
@@ -1874,6 +1912,7 @@ def compute_signals(df_1m, df_5m, ticker=None, pm_high=None, pm_low=None):
         "sma20":       bs("SMA20 MTF",      2, sma_b1 and sma_b5,      f"{sma20_1m:.2f}" if _valid(sma20_1m) else "--",  sma_b1, sma_b5),
         "ema9":        bs("EMA9 ↑",           1, ema9_b,                 ema9_lbl),
         "ema50":       bs("EMA50 ↑",         1, ema50_b,                ema50_lbl),
+        "ema_cross":   bs("EMA9×SMA20 ↑",   1, ema_cross_bull,         f"EMA9 {ema9_1m_val} > SMA20 {sma20_1m}" if ema_cross_bull else "--"),
         "adx":         bs("ADX Bull",        1, adx_b,                  f"{adx_val:.1f}"  if _valid(adx_val)  else "--"),
         "rsi":         bs("RSI 45-65",       1, rsi_b,                  f"{rsi_1m:.1f}"   if _valid(rsi_1m)   else "--"),
         "ftfc":        bs("FTFC MTF",        2, ftfc_b1 and ftfc_b5,    f"{ftfc_1m*100:.0f}%" if _valid(ftfc_1m) else "--", ftfc_b1, ftfc_b5),
@@ -1905,6 +1944,7 @@ def compute_signals(df_1m, df_5m, ticker=None, pm_high=None, pm_low=None):
         "pm_high_break":bs("PM High Break ↑", 1, pm_high_b,               f"${pm_high:.2f}" if pm_high else "--"),
         # ── Candle patterns + regime (Phase 10) ───────────────────────────────
         "candle_bull": bs("Candle Pattern ↑", 1, candle_bull_pat is not None, candle_bull_pat or "None"),
+        "consec_bars": bs("Consec Green ×3", 1, consec_bull,              f"×{consec_count} bars" if consec_bull else "--"),
         "regime_bull": bs("Regime: Bull",     1, regime_bull_ok,          regime_label),
         # ── Fibonacci zones (Phase 11) ─────────────────────────────────────────
         "fib_support": bs("Fib Support",      1, fib_support_ok,          fib_label),
@@ -1940,6 +1980,7 @@ def compute_signals(df_1m, df_5m, ticker=None, pm_high=None, pm_low=None):
         "sma20":       bs("SMA20 MTF",       2, sma_r1 and sma_r5,     f"{sma20_1m:.2f}" if _valid(sma20_1m) else "--",  sma_r1, sma_r5),
         "ema9":        bs("EMA9 ↓",            1, ema9_r,                ema9_lbl),
         "ema50":       bs("EMA50 ↓",          1, ema50_r,               ema50_lbl),
+        "ema_cross":   bs("EMA9×SMA20 ↓",    1, ema_cross_bear,        f"EMA9 {ema9_1m_val} < SMA20 {sma20_1m}" if ema_cross_bear else "--"),
         "adx":         bs("ADX Bear",         1, adx_r,                 f"{adx_val:.1f}"  if _valid(adx_val)  else "--"),
         "rsi":         bs("RSI 35-55",        1, rsi_r,                 f"{rsi_1m:.1f}"   if _valid(rsi_1m)   else "--"),
         "ftfc":        bs("FTFC Bear MTF",    2, ftfc_r1 and ftfc_r5,   f"{(1-ftfc_1m)*100:.0f}%" if _valid(ftfc_1m) else "--", ftfc_r1, ftfc_r5),
@@ -1971,6 +2012,7 @@ def compute_signals(df_1m, df_5m, ticker=None, pm_high=None, pm_low=None):
         "pm_low_break":bs("PM Low Break ↓",   1, pm_low_r,                f"${pm_low:.2f}" if pm_low else "--"),
         # ── Candle patterns + regime (Phase 10) ───────────────────────────────
         "candle_bear": bs("Candle Pattern ↓", 1, candle_bear_pat is not None, candle_bear_pat or "None"),
+        "consec_bars": bs("Consec Red ×3",   1, consec_bear,             f"×{consec_count} bars" if consec_bear else "--"),
         "regime_bear": bs("Regime: Bear",     1, regime_bear_ok,          regime_label),
         # ── Fibonacci zones (Phase 11) ─────────────────────────────────────────
         "fib_resist":  bs("Fib Resistance",   1, fib_resist_ok,           fib_label),
@@ -3443,6 +3485,78 @@ function renderEconCalendar() {
 }
 
 // ── Signal Analytics tab ──────────────────────────────────────────────────────
+// ── Phase 19: Cross-ticker signal heatmap ────────────────────────────────────
+function renderHeatmap() {
+  if (!allData || !Object.keys(allData).length) return '';
+  const cats    = ['TECH','PATTERN','LEVELS','INST','MARKET'];
+  const catClrs = {TECH:'#2266cc',PATTERN:'#cc7700',LEVELS:'#8833cc',INST:'#cc9900',MARKET:'#008855'};
+
+  // Header row
+  let html = `<div style="border-bottom:1px solid #1a1a1a;padding-bottom:10px;margin-bottom:10px">
+  <div class="section-title">Cross-Ticker Signal Heatmap</div>
+  <div style="overflow-x:auto">
+  <table style="width:100%;border-collapse:collapse;font-size:.72rem">
+  <thead><tr style="color:#333;text-transform:uppercase;font-size:.58rem">
+    <th style="padding:3px 6px;text-align:left;width:48px"></th>
+    <th style="padding:3px 4px;text-align:center;width:32px">Dir</th>
+    <th style="padding:3px 4px;text-align:center;width:44px">Score</th>
+    <th style="padding:3px 4px;text-align:center;width:38px">CQ</th>`;
+  for (const cat of cats) {
+    html += `<th style="padding:3px 4px;text-align:center;color:${catClrs[cat]}">${cat.slice(0,3)}</th>`;
+  }
+  html += `<th style="padding:3px 4px;text-align:left">Setup</th></tr></thead><tbody>`;
+
+  for (const [ticker, d] of Object.entries(allData)) {
+    const dir      = d.direction || 'NEUTRAL';
+    const isActive = ticker === curTicker;
+    const activeDir= dir === 'BEAR' ? 'bear' : 'bull';
+    const score    = activeDir === 'bear' ? d.bear_score : d.bull_score;
+    const cq       = activeDir === 'bear' ? d.bear_cq    : d.bull_cq;
+    const vel      = activeDir === 'bear' ? d.bear_velocity : d.bull_velocity;
+    const breakdown= activeDir === 'bear' ? d.bear_breakdown : d.bull_breakdown;
+    const signals  = activeDir === 'bear' ? d.bear_signals : d.bull_signals;
+    const dirClr   = dir === 'BULL' ? '#00ff88' : dir === 'BEAR' ? '#ff6666' : '#555';
+    const scorePct = score / MAX_SCORE;
+    const scoreClr = scorePct >= 0.65 ? '#00ff88' : scorePct >= 0.45 ? '#aaff00' : scorePct >= 0.28 ? '#ffaa00' : '#ff4444';
+    const cqMeta   = {HIGH:{c:'#00ff88',s:'★H'},MED:{c:'#ffcc00',s:'◆M'},LOW:{c:'#ff9944',s:'▲L'},WEAK:{c:'#444',s:'W'}}[cq]||{c:'#444',s:'-'};
+    const velStr   = vel === null || vel === undefined ? '' : vel >= 2 ? `<span style="color:#00ff88">↑${vel}</span>` : vel >= 1 ? `<span style="color:#88ff88">↑1</span>` : vel === 0 ? `<span style="color:#333">→</span>` : `<span style="color:#ff6666">↓${Math.abs(vel)}</span>`;
+    const grd      = setupGrade(d, activeDir);
+
+    const rowBg = isActive ? ';background:#0a0a1a' : '';
+    html += `<tr style="border-bottom:1px solid #0d0d0d;cursor:pointer${rowBg}" onclick="selectTicker('${ticker}')">
+      <td style="padding:3px 6px;font-weight:${isActive?'700':'500'};color:${isActive?'#fff':'#aaa'}">${ticker}</td>
+      <td style="padding:3px 4px;text-align:center;color:${dirClr};font-size:.65rem;font-weight:700">${dir[0]}</td>
+      <td style="padding:3px 4px;text-align:center">
+        <span style="color:${scoreClr};font-weight:600">${score}</span>
+        <span style="color:#333;font-size:.6rem">/${MAX_SCORE}</span>
+        ${velStr}
+      </td>
+      <td style="padding:3px 4px;text-align:center;color:${cqMeta.c};font-size:.65rem;font-weight:700">${cqMeta.s}</td>`;
+
+    for (const cat of cats) {
+      // Count active signals in this category
+      const catSigs  = Object.entries(signals || {}).filter(([k]) => (SIGNAL_CATEGORIES[k]||'') === cat);
+      const active   = catSigs.filter(([,v]) => v.active).length;
+      const total    = catSigs.length;
+      const intensity= total > 0 ? active / total : 0;
+      const alpha    = Math.round(intensity * 100);
+      const cellBg   = active > 0 ? `background:${catClrs[cat]}${alpha.toString(16).padStart(2,'0')}` : '';
+      const txt      = total > 0 ? `${active}/${total}` : '–';
+      const txtClr   = active > 0 ? catClrs[cat] : '#282828';
+      html += `<td style="padding:3px 4px;text-align:center;${cellBg};border-radius:2px">
+        <span style="color:${txtClr};font-weight:${active>0?'600':'400'}">${txt}</span>
+      </td>`;
+    }
+
+    html += `<td style="padding:3px 6px;font-size:.7rem">
+      <span style="color:${grd.c};font-weight:700">${grd.g}</span>
+    </td></tr>`;
+  }
+
+  html += '</tbody></table></div></div>';
+  return html;
+}
+
 function renderAnalytics() {
   const panel = document.getElementById('analytics-panel');
   if (!panel) return;
@@ -3688,7 +3802,7 @@ function renderAnalytics() {
   })() : ''}
 </div>` : '';
 
-  panel.innerHTML = keyLevelsHtml + tradesHtml + `
+  panel.innerHTML = renderHeatmap() + keyLevelsHtml + tradesHtml + `
 <div class="row g-2">
   <div class="col-12">
     <div class="d-flex flex-wrap gap-2" style="font-size:.78rem">
