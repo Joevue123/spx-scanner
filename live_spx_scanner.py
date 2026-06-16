@@ -21,6 +21,8 @@ from flask import Flask, jsonify
 from polygon import RESTClient
 from waitress import serve as _waitress_serve
 from alpaca.trading.client import TradingClient
+from alpaca.data.historical import StockHistoricalDataClient
+from alpaca.data.requests import StockLatestTradeRequest
 from alpaca.trading.requests import (
     MarketOrderRequest, TakeProfitRequest, StopLossRequest, GetOrdersRequest
 )
@@ -1150,11 +1152,12 @@ def send_notifications(ticker, price, bull_score, bear_score, direction,
 
     _last_alert_times[ticker] = now
     if stop and tp:
-        opened = track_signal(ticker, price, stop, tp, direction, score, cq=cq)
-        if opened:
-            alpaca_id = submit_alpaca_order(ticker, direction, price, stop, tp, score, cq)
-            if alpaca_id:
-                # Tag the open trade with its Alpaca order ID
+        # Submit to Alpaca first; only open in-memory trade if order succeeds
+        # (prevents stale open_trades blocking retries after a failed order)
+        alpaca_id = submit_alpaca_order(ticker, direction, price, stop, tp, score, cq, atr=atr)
+        if not ALPACA_ENABLED or alpaca_id:
+            opened = track_signal(ticker, price, stop, tp, direction, score, cq=cq)
+            if opened and alpaca_id:
                 for t in open_trades.values():
                     if t["ticker"] == ticker and t["direction"] == direction:
                         t["alpaca_order_id"] = alpaca_id
@@ -1175,6 +1178,7 @@ def send_notifications(ticker, price, bull_score, bear_score, direction,
 # Pipeline: [1] CQ Gate  →  [2] Conflict Guard  →  [3] Dynamic Sizing  →  [4] OCA Bracket
 
 _alpaca_client: TradingClient | None = None
+_alpaca_data_client: StockHistoricalDataClient | None = None
 
 def _get_alpaca() -> TradingClient | None:
     global _alpaca_client
@@ -1186,6 +1190,26 @@ def _get_alpaca() -> TradingClient | None:
         except Exception as e:
             print(f"[ALPACA] Client init failed: {e}", flush=True)
     return _alpaca_client
+
+def _get_alpaca_data() -> StockHistoricalDataClient | None:
+    global _alpaca_data_client
+    if _alpaca_data_client is None and ALPACA_ENABLED:
+        try:
+            _alpaca_data_client = StockHistoricalDataClient(ALPACA_API_KEY, ALPACA_SECRET_KEY)
+        except Exception as e:
+            print(f"[ALPACA] Data client init failed: {e}", flush=True)
+    return _alpaca_data_client
+
+def _get_live_price(ticker: str, fallback: float) -> float:
+    """Fetch the latest trade price from Alpaca data API; fall back to scanner price."""
+    try:
+        dc = _get_alpaca_data()
+        if dc:
+            resp = dc.get_stock_latest_trade(StockLatestTradeRequest(symbol_or_symbols=ticker))
+            return float(resp[ticker].price)
+    except Exception as e:
+        print(f"[ALPACA] Live price fetch failed [{ticker}]: {e}", flush=True)
+    return fallback
 
 
 # ── [1] CQ Gate ──────────────────────────────────────────────────────────────
@@ -1239,13 +1263,13 @@ def _calc_order_qty(price: float, score: int) -> float:
     SPY/QQQ/IWM/NVDA/AAPL), minimum 0.01 shares.
     """
     target_usd = round(TRADE_SIZE_USD * (score / MAX_SCORE), 2)
-    qty        = round(target_usd / price, 2)
-    return max(0.01, qty)
+    qty        = max(1, int(target_usd / price))  # whole shares — bracket orders reject fractional
+    return qty
 
 
 # ── [4] OCA Bracket Submission ───────────────────────────────────────────────
 def submit_alpaca_order(ticker: str, direction: str, price: float,
-                        stop: float, tp: float, score: int, cq: str):
+                        stop: float, tp: float, score: int, cq: str, atr: float | None = None):
     """
     Full execution pipeline:  CQ Gate → Conflict Guard → Sizing → OCA Bracket
 
@@ -1273,8 +1297,18 @@ def submit_alpaca_order(ticker: str, direction: str, price: float,
     if _alpaca_has_conflict(client, ticker, direction):
         return None
 
+    # [3] Anchor to live Alpaca price to avoid stale-data SL/TP rejection
+    live_price = _get_live_price(ticker, price)
+    if atr and atr > 0:
+        if direction == "BULL":
+            stop = round(live_price - ATR_STOP_MULT * atr, 2)
+            tp   = round(live_price + ATR_TP_MULT   * atr, 2)
+        else:
+            stop = round(live_price + ATR_STOP_MULT * atr, 2)
+            tp   = round(live_price - ATR_TP_MULT   * atr, 2)
+
     # [3] Dynamic Sizing  →  target_usd = $500 × (score / 100)
-    qty        = _calc_order_qty(price, score)
+    qty        = _calc_order_qty(live_price, score)
     target_usd = round(TRADE_SIZE_USD * (score / MAX_SCORE), 2)
     side       = OrderSide.BUY if direction == "BULL" else OrderSide.SELL
 
@@ -1290,7 +1324,7 @@ def submit_alpaca_order(ticker: str, direction: str, price: float,
             stop_loss=StopLossRequest(    stop_price=round(stop, 2)),
         )
         order    = client.submit_order(req)
-        notional = round(qty * price, 2)
+        notional = round(qty * live_price, 2)
         env      = "PAPER" if ALPACA_PAPER else "LIVE"
         sl_pct   = abs(price - stop) / price * 100
         tp_pct   = abs(tp   - price) / price * 100
