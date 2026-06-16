@@ -36,7 +36,7 @@ WATCHLIST             = ["SPY", "QQQ", "IWM", "NVDA", "AAPL"]
 SIGNAL_LOG_FILE       = "/tmp/signal_log.json"
 CSV_LOG_FILE          = "/tmp/signals.csv"
 HISTORY_FILE_TMPL     = "/tmp/score_history_{}.json"
-MAX_SCORE             = 35       # 20 + 5 inst + 2 pivot + 2 candle/regime + 2 fib + 2 volume-profile + 2 stochrsi
+MAX_SCORE             = 36       # 20 + 5 inst + 2 pivot + 2 candle/regime + 2 fib + 2 volume-profile + 2 stochrsi + 1 session_range
 ALERT_COOLDOWN_SECS   = 900
 VOLUME_SPIKE_MULT     = 3.0
 ALERT_SCORE_THRESHOLD = 9
@@ -103,6 +103,7 @@ SIGNAL_CATEGORIES = {
     "fib_support":"LEVELS","fib_resist":"LEVELS","fib_ext":"LEVELS",
     "vpoc_bull":"LEVELS","vpoc_bear":"LEVELS",
     "above_vah":"LEVELS","below_val":"LEVELS",
+    "session_range":"LEVELS",
     # INST — institutional and smart-money flow
     "block_print":"INST","flow_unusual":"INST","vol_delta":"INST",
     "vwap_def":"INST",  "tape_read":"INST",  "obv":"INST",
@@ -1189,6 +1190,10 @@ _blank_ticker = lambda t: {
     # Phase 12
     "vpoc": None, "vah": None, "val": None, "vp_profile": [],
     "vwap_1u": None, "vwap_1d": None, "vwap_2u": None, "vwap_2d": None,
+    # Phase 16
+    "session_open": None, "session_high": None, "session_low": None,
+    "range_pos_pct": None, "session_chg_pct": None,
+    "top_call_strikes": [], "top_put_strikes": [],
     # Phase 15
     "obv_trend": None, "bull_velocity": None, "bear_velocity": None,
     # Phase 14
@@ -1579,6 +1584,18 @@ def compute_signals(df_1m, df_5m, ticker=None):
     except Exception:
         pass
 
+    # ── Phase 16: Session range stats (zero new API calls) ───────────────────
+    session_open = session_high = session_low = range_pos_pct = session_chg_pct = None
+    session_range_bull = session_range_bear = False
+    try:
+        if len(_today_raw) >= 1:
+            session_open = round(float(_today_raw['Open'].iloc[0]), 2)
+            session_high = round(float(_today_raw['High'].max()),   2)
+            session_low  = round(float(_today_raw['Low'].min()),    2)
+            rng = session_high - session_low
+    except Exception:
+        rng = 0
+
     # ── Snapshot values ───────────────────────────────────────────────────────
     price    = float(df['Close'].iloc[-1])
     sma20_1m = float(df['sma20'].iloc[-1])
@@ -1590,6 +1607,16 @@ def compute_signals(df_1m, df_5m, ticker=None):
     sma20_5m = float(df5['sma20'].iloc[-1])
     st_5m    = float(df5['st'].iloc[-1])
     price_5m = float(df5['Close'].iloc[-1])
+
+    try:
+        if session_high is not None and session_low is not None and rng > 0.01:
+            range_pos_pct      = round((price - session_low) / rng * 100, 1)
+            session_range_bull = range_pos_pct <= 25
+            session_range_bear = range_pos_pct >= 75
+        if session_open and session_open > 0:
+            session_chg_pct = round((price - session_open) / session_open * 100, 2)
+    except Exception:
+        pass
 
     ha_bull_1m = _calc_ha_bull(df)
     ha_bull_5m = _calc_ha_bull(df5)
@@ -1839,6 +1866,9 @@ def compute_signals(df_1m, df_5m, ticker=None):
         # ── Volume profile (Phase 12) ──────────────────────────────────────────
         "vpoc_bull":   bs("Above VPOC",       1, vpoc_bull_ok,            vpoc_str),
         "above_vah":   bs("Above VAH ↑",      1, above_vah_ok,            va_pos),
+        # ── Phase 16: Session range ────────────────────────────────────────────
+        "session_range": bs("Session Low Zone",1, session_range_bull,
+                            f"{range_pos_pct:.0f}% of rng" if range_pos_pct is not None else "--"),
     }
     bull_score = sum(s['points'] for s in bull.values() if s['active'])
 
@@ -1899,6 +1929,9 @@ def compute_signals(df_1m, df_5m, ticker=None):
         # ── Volume profile (Phase 12) ──────────────────────────────────────────
         "vpoc_bear":   bs("Below VPOC",       1, vpoc_bear_ok,            vpoc_str),
         "below_val":   bs("Below VAL ↓",      1, below_val_ok,            va_pos),
+        # ── Phase 16: Session range ────────────────────────────────────────────
+        "session_range": bs("Session High Zone",1, session_range_bear,
+                            f"{range_pos_pct:.0f}% of rng" if range_pos_pct is not None else "--"),
     }
     bear_score = sum(s['points'] for s in bear.values() if s['active'])
 
@@ -1991,6 +2024,12 @@ def compute_signals(df_1m, df_5m, ticker=None):
         # Phase 14: Stochastic RSI
         "stochrsi_k": stochrsi_k,
         "stochrsi_d": stochrsi_d,
+        # Phase 16: session range
+        "session_open":    session_open,
+        "session_high":    session_high,
+        "session_low":     session_low,
+        "range_pos_pct":   range_pos_pct,
+        "session_chg_pct": session_chg_pct,
         # Phase 15: OBV trend
         "obv_trend": obv_trend,
         # Phase 13: confluence quality breakdown
@@ -2085,6 +2124,15 @@ def fetch_options_flow(ticker_sym):
             unusual_puts  = net_flow == "puts"
         # Phase 9: max pain from same chain (no extra API call)
         max_pain = _compute_max_pain(calls, puts)
+        # Phase 16: gamma walls — top OI strikes above/below price (no extra API call)
+        try:
+            top_calls_raw = calls.nlargest(3, 'openInterest')[['strike','openInterest']].fillna(0)
+            top_puts_raw  = puts.nlargest(3,  'openInterest')[['strike','openInterest']].fillna(0)
+            top_call_strikes = [{"strike": float(r['strike']), "oi": int(r['openInterest'])} for _, r in top_calls_raw.iterrows()]
+            top_put_strikes  = [{"strike": float(r['strike']), "oi": int(r['openInterest'])} for _, r in top_puts_raw.iterrows()]
+        except Exception:
+            top_call_strikes = []
+            top_put_strikes  = []
         options_data[ticker_sym] = {
             "pcr":          pcr_vol,
             "pcr_oi":       pcr_oi,
@@ -2097,7 +2145,9 @@ def fetch_options_flow(ticker_sym):
             "unusual_calls":unusual_calls,
             "unusual_puts": unusual_puts,
             "net_flow":     net_flow,
-            "max_pain":     max_pain,
+            "max_pain":          max_pain,
+            "top_call_strikes":  top_call_strikes,
+            "top_put_strikes":   top_put_strikes,
             "expiry":       exps[0],
             "last_update":  datetime.now().strftime("%H:%M:%S"),
         }
@@ -2112,8 +2162,10 @@ def fetch_options_flow(ticker_sym):
                 "put_oi":       int(put_oi),
                 "unusual_calls":unusual_calls,
                 "unusual_puts": unusual_puts,
-                "net_flow":     net_flow,
-                "max_pain":     max_pain,
+                "net_flow":          net_flow,
+                "max_pain":          max_pain,
+                "top_call_strikes":  top_call_strikes,
+                "top_put_strikes":   top_put_strikes,
             })
         sent    = "bull" if (pcr_vol and pcr_vol < PCR_BULL_THRESH) else "bear" if (pcr_vol and pcr_vol > PCR_BEAR_THRESH) else "neutral"
         pv_str  = f"{pcr_vol:.2f}" if pcr_vol is not None else "--"
@@ -2299,6 +2351,14 @@ async def scan_ticker(client, ticker, market_open):
         "vp_profile": result['vp_profile'],
         "vwap_1u": result['vwap_1u'], "vwap_1d": result['vwap_1d'],
         "vwap_2u": result['vwap_2u'], "vwap_2d": result['vwap_2d'],
+        # Phase 16: session range + gamma walls
+        "session_open":      result.get('session_open'),
+        "session_high":      result.get('session_high'),
+        "session_low":       result.get('session_low'),
+        "range_pos_pct":     result.get('range_pos_pct'),
+        "session_chg_pct":   result.get('session_chg_pct'),
+        "top_call_strikes":  options_data.get(ticker, {}).get('top_call_strikes', []),
+        "top_put_strikes":   options_data.get(ticker, {}).get('top_put_strikes', []),
         # Phase 15
         "obv_trend":     result.get('obv_trend'),
         "bull_velocity": bull_velocity,
@@ -3012,6 +3072,28 @@ function renderContextRow() {
     const rsCls   = d.rs_signal === 'leader' ? 'ctx-bull' : d.rs_signal === 'lagger' ? 'ctx-bear' : 'ctx-neutral';
     const rsSign  = d.rs_vs_spy > 0 ? '+' : '';
     html += `<span class="ctx-badge ${rsCls}" title="Session performance vs SPY">RS ${rsSign}${d.rs_vs_spy.toFixed(2)}% vs SPY</span>`;
+  }
+
+  // Phase 16: Session range position
+  if (d.session_high != null && d.session_low != null && d.range_pos_pct != null) {
+    const rng    = d.session_high - d.session_low;
+    const rCls   = d.range_pos_pct <= 25 ? 'ctx-bull' : d.range_pos_pct >= 75 ? 'ctx-bear' : 'ctx-neutral';
+    const chgStr = d.session_chg_pct != null ? ` ${d.session_chg_pct >= 0 ? '+' : ''}${d.session_chg_pct.toFixed(2)}%` : '';
+    html += `<span class="ctx-badge ${rCls}" title="Session range: H $${d.session_high.toFixed(2)} / L $${d.session_low.toFixed(2)} (±$${rng.toFixed(2)}) — price at ${d.range_pos_pct.toFixed(0)}% of today&#39;s range${chgStr ? '; today ' + chgStr : ''}">Range ${d.range_pos_pct.toFixed(0)}%${chgStr}</span>`;
+  }
+
+  // Phase 16: Gamma walls (call wall = nearest high-OI call above price; put wall = nearest high-OI put below price)
+  if (d.top_call_strikes && d.top_call_strikes.length && d.price != null) {
+    const callWall = d.top_call_strikes.filter(s => s.strike >= d.price).sort((a,b) => a.strike - b.strike)[0];
+    const putWall  = d.top_put_strikes  && d.top_put_strikes.filter(s => s.strike <= d.price).sort((a,b) => b.strike - a.strike)[0];
+    if (callWall) {
+      const dist = ((callWall.strike - d.price) / d.price * 100).toFixed(1);
+      html += `<span class="ctx-badge ctx-bear" title="Call Wall: largest open-interest call strike above price. Dealers short calls here must buy stock as price rises — acts as resistance magnet at expiry.">Call Wall $${callWall.strike.toFixed(0)} (+${dist}%)</span>`;
+    }
+    if (putWall) {
+      const dist = ((d.price - putWall.strike) / d.price * 100).toFixed(1);
+      html += `<span class="ctx-badge ctx-bull" title="Put Wall: largest open-interest put strike below price. Dealers short puts here must sell stock as price falls — acts as support floor at expiry.">Put Wall $${putWall.strike.toFixed(0)} (-${dist}%)</span>`;
+    }
   }
 
   row.innerHTML = html;
