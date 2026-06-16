@@ -2155,7 +2155,7 @@ def compute_signals(df_1m, df_5m, ticker=None, pm_high=None, pm_low=None):
     sma200_r = (_valid(sma200_1m_val) and price    < sma200_1m_val and
                 _valid(sma200_5m_val) and price_5m < sma200_5m_val)
     sma200_lbl = (f"1m:{sma200_1m_val:.2f} 5m:{sma200_5m_val:.2f}"
-                  if sma200_1m_val is not None else "--")
+                  if sma200_1m_val is not None and sma200_5m_val is not None else "--")
 
     # ── Bull signals ───────────────────────────────────────────────────────────
     sma_b1 = _valid(sma20_1m) and price    > sma20_1m
@@ -4549,14 +4549,507 @@ setInterval(update, 5000);
 </body>
 </html>"""
 
+# ====================== BACKTEST ENGINE ======================
+# Runs once at startup in the background. Fetches 60 trading days of historical
+# 1m data (one Polygon call per ticker, resampled to 5m internally), then walks
+# forward through every BT_SAMPLE_EVERY bars calling the live compute_signals()
+# function on a rolling BT_LOOKBACK-bar window. Trades are simulated with the
+# same ATR-based SL/TP used by the live execution layer.
+
+BT_DAYS         = 90    # calendar days to request (≈ 60 trading days)
+BT_LIMIT        = 50000 # max bars per API call (fits 60d × 390min/d comfortably)
+BT_LOOKBACK     = 500   # rolling window size passed to compute_signals()
+BT_MIN_BARS     = 350   # minimum bars before first signal check (needs SMA200 warmup)
+BT_SAMPLE_EVERY = 15    # evaluate signals every N 1m bars (15-minute cadence)
+BT_MAX_HOLD     = 240   # 4-hour maximum hold before TIMEOUT
+
+_backtest_state: dict = {
+    "status":       "pending",   # pending | running | done | error
+    "progress":     "",
+    "pct":          0,
+    "started_at":   None,
+    "completed_at": None,
+    "tickers":      {},          # {ticker: {trades, stats}}
+    "summary":      {},          # aggregate across all tickers
+}
+
+
+def _bt_agg_trades(trades: list) -> dict:
+    """Compute per-CQ-tier win rate, avg R, profit factor, and best score threshold."""
+    if not trades:
+        return {}
+
+    by_cq: dict = {t: [] for t in ("HIGH", "MED", "LOW", "WEAK")}
+    for tr in trades:
+        by_cq.setdefault(tr["cq"], []).append(tr)
+
+    out = {}
+    for tier, bucket in by_cq.items():
+        if not bucket:
+            continue
+        wins  = [t for t in bucket if t["result"] == "WIN"]
+        loses = [t for t in bucket if t["result"] == "LOSS"]
+        tos   = [t for t in bucket if t["result"] == "TIMEOUT"]
+        rs    = [t["r_mult"] for t in bucket]
+        total = len(bucket)
+        avg_r = round(sum(rs) / total, 2) if rs else 0.0
+        gross_w = sum(r for r in rs if r > 0)
+        gross_l = abs(sum(r for r in rs if r < 0)) or 0.001
+        pf      = round(gross_w / gross_l, 2)
+
+        # Walk score thresholds 5 points at a time; keep the one with highest EV
+        best_thresh = LOG_SCORE_THRESHOLD
+        best_ev     = avg_r
+        for thresh in range(LOG_SCORE_THRESHOLD, MAX_SCORE, 5):
+            sub = [t for t in bucket if t["score"] >= thresh]
+            if len(sub) < max(3, total * 0.10):   # need at least 10% sample floor
+                break
+            sub_rs = [t["r_mult"] for t in sub]
+            ev = sum(sub_rs) / len(sub_rs)
+            if ev > best_ev:
+                best_ev     = round(ev, 2)
+                best_thresh = thresh
+
+        out[tier] = {
+            "trades":      total,
+            "wins":        len(wins),
+            "losses":      len(loses),
+            "timeouts":    len(tos),
+            "win_rate":    round(len(wins) / total * 100, 1),
+            "avg_r":       avg_r,
+            "total_r":     round(sum(rs), 2),
+            "profit_factor": pf,
+            "best_thresh": best_thresh,
+            "best_ev":     best_ev,
+        }
+    return out
+
+
+def _bt_simulate_ticker(ticker: str, df_full: pd.DataFrame) -> list:
+    """
+    Walk forward through df_full (RTH 1m bars), evaluating signals every
+    BT_SAMPLE_EVERY bars. For each signal above LOG_SCORE_THRESHOLD, simulate
+    a trade: entry = next bar open, exit via ATR SL/TP or BT_MAX_HOLD timeout.
+    Returns list of trade dicts.
+    """
+    trades      = []
+    n           = len(df_full)
+    skip_until  = 0   # bar index — skip if inside an open trade
+
+    for i in range(BT_MIN_BARS, n, BT_SAMPLE_EVERY):
+        if i <= skip_until:
+            continue
+
+        # Rolling window for indicators
+        slice_1m = df_full.iloc[max(0, i - BT_LOOKBACK): i].copy().reset_index(drop=True)
+        slice_5m = resample_to_5m(slice_1m)
+
+        if len(slice_1m) < 50 or len(slice_5m) < 10:
+            continue
+
+        try:
+            res = compute_signals(slice_1m, slice_5m, ticker=ticker)
+        except Exception as _bt_ex:
+            if not trades:   # log only the first failure per ticker
+                print(f"[BACKTEST] {ticker} compute_signals error at bar {i}: {_bt_ex}", flush=True)
+                traceback.print_exc()
+            continue
+
+        bull_s = res.get("bull_score", 0)
+        bear_s = res.get("bear_score", 0)
+
+        # Decide direction: higher score wins; skip if both below log threshold
+        if bull_s >= bear_s and bull_s >= LOG_SCORE_THRESHOLD:
+            direction = "BULL"
+            score     = bull_s
+            cq        = res.get("bull_cq", "WEAK")
+            sl        = res.get("bull_stop")
+            tp_price  = res.get("bull_tp")
+        elif bear_s > bull_s and bear_s >= LOG_SCORE_THRESHOLD:
+            direction = "BEAR"
+            score     = bear_s
+            cq        = res.get("bear_cq", "WEAK")
+            sl        = res.get("bear_stop")
+            tp_price  = res.get("bear_tp")
+        else:
+            continue
+
+        if sl is None or tp_price is None:
+            continue
+
+        # Entry: open of the next bar after signal
+        entry_idx = min(i, n - 1)
+        entry     = float(df_full.iloc[entry_idx]["Open"])
+        if entry <= 0:
+            continue
+
+        # Recompute SL/TP from live ATR if available (handles price differences
+        # between the window close and the next bar's open)
+        atr = res.get("atr")
+        if atr and atr > 0:
+            if direction == "BULL":
+                sl       = entry - ATR_STOP_MULT * atr
+                tp_price = entry + ATR_TP_MULT   * atr
+            else:
+                sl       = entry + ATR_STOP_MULT * atr
+                tp_price = entry - ATR_TP_MULT   * atr
+
+        risk = abs(entry - sl)
+        if risk < 1e-6:
+            continue
+
+        # Walk forward bar-by-bar to find exit
+        result_label = "TIMEOUT"
+        exit_price   = float(df_full.iloc[min(entry_idx + BT_MAX_HOLD - 1, n - 1)]["Close"])
+        exit_idx     = entry_idx + BT_MAX_HOLD
+
+        for j in range(entry_idx + 1, min(entry_idx + BT_MAX_HOLD, n)):
+            bar_lo = float(df_full.iloc[j]["Low"])
+            bar_hi = float(df_full.iloc[j]["High"])
+
+            if direction == "BULL":
+                if bar_lo <= sl:             # SL hit first (conservative)
+                    result_label = "LOSS"
+                    exit_price   = sl
+                    exit_idx     = j
+                    break
+                if bar_hi >= tp_price:
+                    result_label = "WIN"
+                    exit_price   = tp_price
+                    exit_idx     = j
+                    break
+            else:  # BEAR
+                if bar_hi >= sl:
+                    result_label = "LOSS"
+                    exit_price   = sl
+                    exit_idx     = j
+                    break
+                if bar_lo <= tp_price:
+                    result_label = "WIN"
+                    exit_price   = tp_price
+                    exit_idx     = j
+                    break
+
+        pnl    = (exit_price - entry) if direction == "BULL" else (entry - exit_price)
+        r_mult = round(pnl / risk, 2)
+
+        trades.append({
+            "ticker":    ticker,
+            "direction": direction,
+            "score":     score,
+            "cq":        cq,
+            "regime":    res.get("regime", "unknown"),
+            "entry":     round(entry, 4),
+            "sl":        round(sl, 4),
+            "tp":        round(tp_price, 4),
+            "exit":      round(exit_price, 4),
+            "result":    result_label,
+            "r_mult":    r_mult,
+            "bar_ts":    int(df_full.iloc[i - 1]["ts"]) if "ts" in df_full.columns else 0,
+        })
+
+        skip_until = exit_idx   # don't take another signal while this trade runs
+
+    return trades
+
+
+async def _run_backtest():
+    """
+    Background task: fetch 60 trading days of 1m data per ticker, walk forward,
+    and populate _backtest_state. Uses 1 Polygon call per ticker (resampled to
+    5m internally) — 5 calls total, well within the free-tier 5/min limit.
+    """
+    global _backtest_state
+    _backtest_state["status"]     = "running"
+    _backtest_state["started_at"] = datetime.now().isoformat()
+
+    # Wait for the scanner's first cycle to complete before hammering Polygon
+    await asyncio.sleep(90)
+
+    client     = RESTClient(POLYGON_API_KEY)
+    all_trades: list = []
+
+    try:
+        for idx, ticker in enumerate(WATCHLIST):
+            pct = int(idx / len(WATCHLIST) * 100)
+            _backtest_state["pct"]      = pct
+            _backtest_state["progress"] = f"Fetching {ticker} ({idx+1}/{len(WATCHLIST)})…"
+            print(f"[BACKTEST] Fetching {ticker} ({BT_DAYS}d)…", flush=True)
+
+            df_raw = await asyncio.get_running_loop().run_in_executor(
+                None,
+                lambda t=ticker: fetch_aggs(client, t, multiplier=1, days=BT_DAYS, limit=BT_LIMIT)
+            )
+
+            if df_raw is None or len(df_raw) < BT_MIN_BARS:
+                print(f"[BACKTEST] {ticker}: insufficient data ({len(df_raw) if df_raw is not None else 0} bars)", flush=True)
+                continue
+
+            df_rth = _filter_rth(df_raw)
+            df_rth = df_rth.reset_index(drop=True)
+
+            if len(df_rth) < BT_MIN_BARS:
+                print(f"[BACKTEST] {ticker}: only {len(df_rth)} RTH bars — skipping", flush=True)
+                continue
+
+            _backtest_state["progress"] = (
+                f"Running signals for {ticker} "
+                f"({len(df_rth)} RTH bars → ~{len(df_rth)//BT_SAMPLE_EVERY} checks)…"
+            )
+            print(f"[BACKTEST] {ticker}: {len(df_rth)} RTH bars — running walk-forward…", flush=True)
+
+            trades = await asyncio.get_running_loop().run_in_executor(
+                None,
+                lambda t=ticker, d=df_rth: _bt_simulate_ticker(t, d)
+            )
+
+            wins = sum(1 for t in trades if t["result"] == "WIN")
+            print(
+                f"[BACKTEST] {ticker}: {len(trades)} trades | "
+                f"{wins}W / {len(trades)-wins}L+T",
+                flush=True
+            )
+
+            stats = _bt_agg_trades(trades)
+            _backtest_state["tickers"][ticker] = {
+                "trades": len(trades),
+                "stats":  stats,
+                "sample": trades[-20:],   # last 20 trades for the UI table
+            }
+            all_trades.extend(trades)
+
+            # Space tickers 20s apart → 3 calls/min from backtest,
+            # leaving 2 slots/min for the live scanner
+            if idx < len(WATCHLIST) - 1:
+                await asyncio.sleep(20)
+
+        _backtest_state["summary"] = {
+            "total_trades": len(all_trades),
+            "by_cq":        _bt_agg_trades(all_trades),
+        }
+        _backtest_state["status"]       = "done"
+        _backtest_state["pct"]          = 100
+        _backtest_state["completed_at"] = datetime.now().isoformat()
+        _backtest_state["progress"]     = f"Complete — {len(all_trades)} trades across {len(WATCHLIST)} tickers"
+        print(f"[BACKTEST] Done: {len(all_trades)} total trades", flush=True)
+
+    except Exception as e:
+        _backtest_state["status"]   = "error"
+        _backtest_state["progress"] = str(e)
+        traceback.print_exc()
+
+
+@app.route("/api/backtest")
+def api_backtest():
+    return jsonify(_backtest_state)
+
+
+@app.route("/backtest")
+def route_backtest():
+    return """<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Backtest — SPX Scanner</title>
+<style>
+  *{box-sizing:border-box;margin:0;padding:0}
+  body{background:#080808;color:#ccc;font-family:monospace;font-size:13px;padding:20px}
+  h1{color:#00ffcc;font-size:1.1rem;margin-bottom:16px;letter-spacing:1px}
+  h2{color:#555;font-size:.75rem;text-transform:uppercase;letter-spacing:.8px;margin:20px 0 8px}
+  .status-bar{background:#111;border:1px solid #1a1a1a;border-radius:6px;padding:12px 16px;margin-bottom:16px}
+  .progress-track{background:#1a1a1a;border-radius:3px;height:6px;margin-top:8px;overflow:hidden}
+  .progress-fill{height:6px;border-radius:3px;background:#00ffcc;transition:width .4s}
+  table{width:100%;border-collapse:collapse;margin-bottom:12px}
+  th{padding:4px 10px;text-align:left;color:#333;font-size:.65rem;text-transform:uppercase;letter-spacing:.5px;border-bottom:1px solid #1a1a1a}
+  td{padding:5px 10px;border-bottom:1px solid #0d0d0d;font-size:.75rem}
+  .g{color:#00ff88} .r{color:#ff6666} .y{color:#ffaa00} .d{color:#555}
+  .badge{display:inline-block;padding:1px 6px;border-radius:3px;font-size:.62rem;font-weight:700}
+  .b-high{background:#00ff8822;color:#00ff88;border:1px solid #00ff8844}
+  .b-med{background:#00ffcc22;color:#00ffcc;border:1px solid #00ffcc44}
+  .b-low{background:#ffaa0022;color:#ffaa00;border:1px solid #ffaa0044}
+  .b-weak{background:#55555522;color:#555;border:1px solid #33333344}
+  .ticker-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(280px,1fr));gap:10px;margin-bottom:16px}
+  .ticker-card{background:#0d0d0d;border:1px solid #1a1a1a;border-radius:5px;padding:12px}
+  .ticker-card h3{color:#aaa;font-size:.78rem;margin-bottom:8px}
+  .pending{color:#333;font-style:italic}
+  a{color:#00ffcc;text-decoration:none}
+</style>
+</head>
+<body>
+<h1>&#x26A1; BACKTEST — 60-Day Walk-Forward</h1>
+<p style="color:#333;font-size:.72rem;margin-bottom:16px">
+  Same <code>compute_signals()</code> + ATR bracket (SL ×""" + str(ATR_STOP_MULT) + """ / TP ×""" + str(ATR_TP_MULT) + """) as live execution &nbsp;|&nbsp;
+  Sample cadence: every """ + str(BT_SAMPLE_EVERY) + """m &nbsp;|&nbsp; Max hold: """ + str(BT_MAX_HOLD) + """m &nbsp;|&nbsp;
+  <a href="/">&#x2190; Dashboard</a>
+</p>
+
+<div class="status-bar">
+  <div style="display:flex;align-items:center;gap:10px">
+    <span id="status-dot" style="width:8px;height:8px;border-radius:50%;background:#333;display:inline-block"></span>
+    <span id="status-text" style="color:#555">Initializing…</span>
+    <span id="status-pct" style="color:#333;margin-left:auto"></span>
+  </div>
+  <div class="progress-track"><div class="progress-fill" id="prog" style="width:0%"></div></div>
+</div>
+
+<div id="content"><p class="pending">Waiting for backtest results…</p></div>
+
+<script>
+const CQ_BADGE = {
+  HIGH:'<span class="badge b-high">HIGH</span>',
+  MED:'<span class="badge b-med">MED</span>',
+  LOW:'<span class="badge b-low">LOW</span>',
+  WEAK:'<span class="badge b-weak">WEAK</span>',
+};
+const STATUS_CLR = {done:'#00ff88',running:'#ffaa00',error:'#ff6666',pending:'#333'};
+
+function fmtR(r){
+  if(r==null) return '<span class="d">–</span>';
+  return r>=0 ? `<span class="g">+${r.toFixed(2)}R</span>` : `<span class="r">${r.toFixed(2)}R</span>`;
+}
+function fmtWR(wr){
+  const c = wr>=60?'g':wr>=45?'y':'r';
+  return `<span class="${c}">${wr.toFixed(1)}%</span>`;
+}
+
+function renderCQTable(byQ, title) {
+  if(!byQ || !Object.keys(byQ).length) return '<p class="pending">No data yet</p>';
+  const rows = ['HIGH','MED','LOW','WEAK'].filter(t=>byQ[t]).map(tier => {
+    const s = byQ[tier];
+    const threshBadge = s.best_thresh > """ + str(LOG_SCORE_THRESHOLD) + """
+      ? `<span style="color:#00ffcc">${s.best_thresh}+</span>`
+      : `<span class="d">${s.best_thresh}</span>`;
+    return `<tr>
+      <td>${CQ_BADGE[tier]}</td>
+      <td>${s.trades}</td>
+      <td>${fmtWR(s.win_rate)}</td>
+      <td>${fmtR(s.avg_r)}</td>
+      <td>${fmtR(s.total_r)}</td>
+      <td style="color:#aaa">${s.profit_factor}×</td>
+      <td>${threshBadge}</td>
+      <td>${fmtR(s.best_ev)}</td>
+    </tr>`;
+  }).join('');
+  return `
+  <table>
+    <thead><tr>
+      <th>CQ Tier</th><th>Trades</th><th>Win%</th>
+      <th>Avg R</th><th>Total R</th><th>Profit Factor</th>
+      <th>Best Threshold</th><th>Best EV/trade</th>
+    </tr></thead>
+    <tbody>${rows}</tbody>
+  </table>`;
+}
+
+function renderTickerCards(tickers) {
+  return Object.entries(tickers).map(([tk, d]) => {
+    const stats = d.stats || {};
+    const rows = ['HIGH','MED','LOW'].filter(t=>stats[t]).map(tier => {
+      const s = stats[tier];
+      return `<tr>
+        <td>${CQ_BADGE[tier]}</td>
+        <td>${s.trades}</td>
+        <td>${fmtWR(s.win_rate)}</td>
+        <td>${fmtR(s.avg_r)}</td>
+      </tr>`;
+    }).join('');
+    return `<div class="ticker-card">
+      <h3>${tk} &nbsp;<span style="color:#333;font-size:.65rem">${d.trades} trades total</span></h3>
+      ${rows ? `<table>
+        <thead><tr><th>CQ</th><th>#</th><th>Win%</th><th>Avg R</th></tr></thead>
+        <tbody>${rows}</tbody>
+      </table>` : '<p class="pending" style="font-size:.7rem">No trades yet</p>'}
+    </div>`;
+  }).join('');
+}
+
+function renderRecentTrades(tickers) {
+  const all = Object.values(tickers).flatMap(d => d.sample || []);
+  if(!all.length) return '';
+  all.sort((a,b) => b.bar_ts - a.bar_ts);
+  const rows = all.slice(0,30).map(t => {
+    const rc  = {WIN:'g',LOSS:'r',TIMEOUT:'d'}[t.result]||'d';
+    const dc  = t.direction==='BULL'?'g':'r';
+    const ts  = t.bar_ts ? new Date(t.bar_ts).toLocaleString('en-US',{timeZone:'America/New_York',month:'numeric',day:'numeric',hour:'2-digit',minute:'2-digit'}) : '–';
+    return `<tr>
+      <td class="d">${ts}</td>
+      <td><b>${t.ticker}</b></td>
+      <td class="${dc}">${t.direction}</td>
+      <td>${CQ_BADGE[t.cq]||t.cq}</td>
+      <td style="color:#aaa">${t.score}</td>
+      <td class="${rc}">${t.result}</td>
+      <td>${fmtR(t.r_mult)}</td>
+      <td class="d" style="font-size:.65rem">${(t.regime||'').replace(/_/g,' ')}</td>
+    </tr>`;
+  }).join('');
+  return `
+  <h2>Recent Trades (last 30 across all tickers)</h2>
+  <table>
+    <thead><tr>
+      <th>Time (ET)</th><th>Ticker</th><th>Dir</th><th>CQ</th>
+      <th>Score</th><th>Result</th><th>R</th><th>Regime</th>
+    </tr></thead>
+    <tbody>${rows}</tbody>
+  </table>`;
+}
+
+async function poll() {
+  try {
+    const r = await fetch('/api/backtest');
+    const d = await r.json();
+
+    const dot  = document.getElementById('status-dot');
+    const txt  = document.getElementById('status-text');
+    const pct  = document.getElementById('status-pct');
+    const prog = document.getElementById('prog');
+    dot.style.background = STATUS_CLR[d.status] || '#333';
+    txt.textContent = d.progress || d.status;
+    pct.textContent = d.pct ? d.pct + '%' : '';
+    prog.style.width = (d.pct || 0) + '%';
+
+    if (d.status === 'running' || d.status === 'pending') {
+      setTimeout(poll, 3000);
+      return;
+    }
+
+    const summary = d.summary || {};
+    const tickers = d.tickers || {};
+    const byQ     = summary.by_cq || {};
+    const total   = summary.total_trades || 0;
+
+    document.getElementById('content').innerHTML = `
+      <h2>Aggregate Performance — ${total} trades across all tickers</h2>
+      ${renderCQTable(byQ, 'All Tickers')}
+      <h2>Per-Ticker Breakdown</h2>
+      <div class="ticker-grid">${renderTickerCards(tickers)}</div>
+      ${renderRecentTrades(tickers)}
+    `;
+
+    if (d.status === 'error') {
+      document.getElementById('status-text').style.color = '#ff6666';
+      setTimeout(poll, 10000);   // retry on error
+    }
+  } catch(e) {
+    setTimeout(poll, 5000);
+  }
+}
+
+poll();
+</script>
+</body>
+</html>"""
+
+
 # ====================== START ======================
 async def _startup():
-    """Run scanner loop and Flask/waitress server concurrently on one event loop."""
+    """Run scanner loop, Flask/waitress server, and backtest concurrently."""
     loop = asyncio.get_running_loop()
     flask_task = loop.run_in_executor(
         None,
         lambda: _waitress_serve(app, host='0.0.0.0', port=8080, threads=4, channel_timeout=120)
     )
+    asyncio.create_task(_run_backtest())
     await asyncio.gather(main(), flask_task)
 
 if __name__ == "__main__":
