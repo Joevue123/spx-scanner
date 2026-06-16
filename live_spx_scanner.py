@@ -5,7 +5,6 @@ import json
 import math
 import os
 import smtplib
-import threading
 import time
 import traceback
 from datetime import datetime, date, timedelta, timezone
@@ -20,6 +19,7 @@ import requests
 import yfinance as yf
 from flask import Flask, jsonify
 from polygon import RESTClient
+from waitress import serve as _waitress_serve
 
 # ====================== CONFIG ======================
 POLYGON_API_KEY   = os.getenv("POLYGON_API_KEY")
@@ -918,7 +918,7 @@ def _fetch_polygon_dark_pool(client, ticker_sym):
 
 # ====================== TRADE TRACKING (Phase 6) ======================
 
-def track_signal(ticker, price, stop, tp, direction, score):
+def track_signal(ticker, price, stop, tp, direction, score, cq="WEAK"):
     """Open a simulated trade. One open trade per ticker+direction at a time."""
     for t in open_trades.values():
         if t["ticker"] == ticker and t["direction"] == direction:
@@ -932,10 +932,11 @@ def track_signal(ticker, price, stop, tp, direction, score):
         "stop":      round(float(stop),  4),
         "tp":        round(float(tp),    4),
         "score":     score,
+        "cq":        cq,
         "open_time": datetime.now().isoformat(),
         "open_ts":   time.time(),
     }
-    print(f"[TRADE] OPEN {ticker} {direction} @ ${price:.2f} SL${stop:.2f} TP${tp:.2f} [{score}/{MAX_SCORE}]", flush=True)
+    print(f"[TRADE] OPEN {ticker} {direction} @ ${price:.2f} SL${stop:.2f} TP${tp:.2f} [{score}/{MAX_SCORE}] CQ={cq}", flush=True)
 
 
 def check_outcomes():
@@ -1134,7 +1135,7 @@ def send_notifications(ticker, price, bull_score, bear_score, direction,
 
     _last_alert_times[ticker] = now
     if stop and tp:
-        track_signal(ticker, price, stop, tp, direction, score)
+        track_signal(ticker, price, stop, tp, direction, score, cq=cq)
 
     dashboard_data[ticker]["alerts"].insert(0, {
         "time":      now.strftime("%H:%M:%S"),
@@ -2615,8 +2616,10 @@ async def scan_ticker(client, ticker, market_open):
         save_signal_log(signal_log)
         log_to_csv(entry)
 
-    # External alerts
-    if market_open and score >= ALERT_SCORE_THRESHOLD:
+    # External alerts — only fire when score is at/above threshold AND rising (not falling through)
+    velocity_now = bull_velocity if direction != 'BEAR' else bear_velocity
+    rising = velocity_now is None or velocity_now >= 0
+    if market_open and score >= ALERT_SCORE_THRESHOLD and rising:
         stop = result['bull_stop'] if direction != "BEAR" else result['bear_stop']
         tp   = result['bull_tp']   if direction != "BEAR" else result['bear_tp']
         send_notifications(ticker, price, bull_score, bear_score, direction,
@@ -2642,7 +2645,7 @@ async def main():
         return
 
     client          = RESTClient(POLYGON_API_KEY)
-    loop            = asyncio.get_event_loop()
+    loop            = asyncio.get_running_loop()
     _econ_last      = None
     _opts_last      = None
     _summary_sent   = None   # date on which daily summary was sent
@@ -3785,6 +3788,33 @@ function renderAnalytics() {
       </span>`;
     }).join('');
 
+  // CQ tier win rate breakdown
+  const byCQ = {HIGH:{w:0,l:0,to:0,rVals:[]}, MED:{w:0,l:0,to:0,rVals:[]}, LOW:{w:0,l:0,to:0,rVals:[]}};
+  for (const o of ots) {
+    const tier = o.cq || null;
+    if (!tier || !byCQ[tier]) continue;
+    const b = byCQ[tier];
+    if (o.result==='WIN') b.w++; else if (o.result==='LOSS') b.l++; else b.to++;
+    if (o.r_multiple != null) b.rVals.push(o.r_multiple);
+  }
+  const cqTableRows = ['HIGH','MED','LOW'].map(tier => {
+    const b = byCQ[tier];
+    const tot = b.w + b.l + b.to;
+    if (!tot) return '';
+    const wr = Math.round(b.w / tot * 100);
+    const avgRv = b.rVals.length ? b.rVals.reduce((a,c)=>a+c,0)/b.rVals.length : null;
+    const rStr  = avgRv !== null ? `${avgRv>=0?'+':''}${avgRv.toFixed(2)}R` : '--';
+    const cqM   = CQ_META[tier] || {clr:'#555', lbl:tier};
+    const wrClr = wr >= 60 ? '#00ff88' : wr >= 45 ? '#ffaa00' : '#ff6666';
+    const rClr  = avgRv === null ? '#555' : avgRv >= 0 ? '#00ff88' : '#ff6666';
+    return `<tr style="border-bottom:1px solid #0d0d0d">
+      <td style="padding:2px 8px;font-size:.72rem;font-weight:700;color:${cqM.clr}">${cqM.lbl}</td>
+      <td style="padding:2px 6px;font-size:.72rem;text-align:right;color:${wrClr};font-weight:600">${wr}%</td>
+      <td style="padding:2px 6px;font-size:.7rem;text-align:center;color:#555">${b.w}W / ${b.l}L${b.to ? ` / ${b.to}T` : ''}</td>
+      <td style="padding:2px 6px;font-size:.72rem;text-align:right;color:${rClr}">${rStr}</td>
+    </tr>`;
+  }).filter(r => r).join('');
+
   // Equity sparkline: cumulative R over closed trades
   let cumR = 0;
   const cumRseries = ots.map(o => { cumR += (o.r_multiple || 0); return cumR; });
@@ -3821,7 +3851,18 @@ function renderAnalytics() {
     <span class="ctx-badge ctx-neutral">PF: ${pf}</span>
     <span class="ctx-badge ${parseFloat(totalR)>=0?'ctx-bull':'ctx-bear'}">Total R: ${parseFloat(totalR)>0?'+':''}${totalR}</span>
   </div>
-  ${tkRows ? `<div style="display:flex;flex-wrap:wrap;gap:3px;margin-bottom:6px">${tkRows}</div>` : ''}`}
+  ${tkRows ? `<div style="display:flex;flex-wrap:wrap;gap:3px;margin-bottom:6px">${tkRows}</div>` : ''}
+  ${cqTableRows ? `
+  <div class="section-title mt-2" style="font-size:.7rem">CQ Tier Performance</div>
+  <table style="width:100%;border-collapse:collapse;margin-bottom:6px">
+    <thead><tr style="color:#333;text-transform:uppercase;font-size:.58rem">
+      <th style="padding:2px 8px;text-align:left">Tier</th>
+      <th style="padding:2px 6px;text-align:right">Win%</th>
+      <th style="padding:2px 6px;text-align:center">Record</th>
+      <th style="padding:2px 6px;text-align:right">Avg R</th>
+    </tr></thead>
+    <tbody>${cqTableRows}</tbody>
+  </table>` : ''}`}
   ${opens.length > 0 ? `
   <div class="section-title mt-2">Open Positions (${opens.length})</div>
   ${opens.map(t => {
@@ -4183,10 +4224,14 @@ setInterval(update, 5000);
 </html>"""
 
 # ====================== START ======================
-threading.Thread(
-    target=lambda: asyncio.run(main()),
-    daemon=True
-).start()
+async def _startup():
+    """Run scanner loop and Flask/waitress server concurrently on one event loop."""
+    loop = asyncio.get_running_loop()
+    flask_task = loop.run_in_executor(
+        None,
+        lambda: _waitress_serve(app, host='0.0.0.0', port=8080, threads=4, channel_timeout=120)
+    )
+    await asyncio.gather(main(), flask_task)
 
 if __name__ == "__main__":
-    app.run(host='0.0.0.0', port=8080, debug=False)
+    asyncio.run(_startup())

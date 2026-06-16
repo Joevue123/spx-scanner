@@ -4,5 +4,5 @@ pandas_ta
 numpy
 flask
 requests
-gunicorn
+waitress
 yfinance
