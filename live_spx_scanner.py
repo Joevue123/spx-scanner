@@ -20,6 +20,9 @@ import yfinance as yf
 from flask import Flask, jsonify
 from polygon import RESTClient
 from waitress import serve as _waitress_serve
+from alpaca.trading.client import TradingClient
+from alpaca.trading.requests import MarketOrderRequest, TakeProfitRequest, StopLossRequest
+from alpaca.trading.enums import OrderSide, TimeInForce, OrderClass
 
 # ====================== CONFIG ======================
 POLYGON_API_KEY   = os.getenv("POLYGON_API_KEY")
@@ -87,6 +90,14 @@ VWAP_DEF_DIST_ATR     = 0.30    # within 0.3×ATR of VWAP to qualify as defense 
 TAPE_BARS             = 3       # consecutive same-direction bars for tape aggression
 TAPE_VOL_MULT         = 1.5     # tape bars must avg this multiple of normal volume
 ICEBERG_VOL_MULT      = 4.0     # iceberg: single bar vol > 4× avg + tiny net move
+
+# ── Alpaca execution config ───────────────────────────────────────────────────
+ALPACA_API_KEY     = os.getenv("ALPACA_API_KEY", "")
+ALPACA_SECRET_KEY  = os.getenv("ALPACA_SECRET_KEY", "")
+ALPACA_PAPER       = os.getenv("ALPACA_PAPER", "true").lower() != "false"
+TRADE_SIZE_USD     = float(os.getenv("TRADE_SIZE_USD", "500"))
+ALPACA_CQ_MIN      = os.getenv("ALPACA_CQ_MIN", "MED")   # MED or HIGH for real orders
+ALPACA_ENABLED     = bool(ALPACA_API_KEY and ALPACA_SECRET_KEY)
 ICEBERG_MOVE_ATR      = 0.15    # iceberg: net move < 0.15×ATR despite huge volume
 VOL_DELTA_LOOKBACK    = 5       # bars to compute cumulative volume delta over
 
@@ -919,10 +930,10 @@ def _fetch_polygon_dark_pool(client, ticker_sym):
 # ====================== TRADE TRACKING (Phase 6) ======================
 
 def track_signal(ticker, price, stop, tp, direction, score, cq="WEAK"):
-    """Open a simulated trade. One open trade per ticker+direction at a time."""
+    """Open a simulated trade. Returns True if new trade opened, False if already tracking."""
     for t in open_trades.values():
         if t["ticker"] == ticker and t["direction"] == direction:
-            return  # already tracking this setup
+            return False
     trade_id = f"{ticker}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
     open_trades[trade_id] = {
         "id":        trade_id,
@@ -937,6 +948,7 @@ def track_signal(ticker, price, stop, tp, direction, score, cq="WEAK"):
         "open_ts":   time.time(),
     }
     print(f"[TRADE] OPEN {ticker} {direction} @ ${price:.2f} SL${stop:.2f} TP${tp:.2f} [{score}/{MAX_SCORE}] CQ={cq}", flush=True)
+    return True
 
 
 def check_outcomes():
@@ -1135,7 +1147,15 @@ def send_notifications(ticker, price, bull_score, bear_score, direction,
 
     _last_alert_times[ticker] = now
     if stop and tp:
-        track_signal(ticker, price, stop, tp, direction, score, cq=cq)
+        opened = track_signal(ticker, price, stop, tp, direction, score, cq=cq)
+        if opened:
+            alpaca_id = submit_alpaca_order(ticker, direction, price, stop, tp, score, cq)
+            if alpaca_id:
+                # Tag the open trade with its Alpaca order ID
+                for t in open_trades.values():
+                    if t["ticker"] == ticker and t["direction"] == direction:
+                        t["alpaca_order_id"] = alpaca_id
+                        break
 
     dashboard_data[ticker]["alerts"].insert(0, {
         "time":      now.strftime("%H:%M:%S"),
@@ -1146,6 +1166,60 @@ def send_notifications(ticker, price, bull_score, bear_score, direction,
         "message":   f"{cq_tag}{direction} confluence{vol}",
     })
     dashboard_data[ticker]["alerts"] = dashboard_data[ticker]["alerts"][:10]
+
+
+# ====================== ALPACA EXECUTION ======================
+
+_alpaca_client: TradingClient | None = None
+
+def _get_alpaca() -> TradingClient | None:
+    global _alpaca_client
+    if _alpaca_client is None and ALPACA_ENABLED:
+        try:
+            _alpaca_client = TradingClient(ALPACA_API_KEY, ALPACA_SECRET_KEY, paper=ALPACA_PAPER)
+            env = "PAPER" if ALPACA_PAPER else "LIVE"
+            print(f"[ALPACA] Client initialized ({env})", flush=True)
+        except Exception as e:
+            print(f"[ALPACA] Client init failed: {e}", flush=True)
+    return _alpaca_client
+
+
+def submit_alpaca_order(ticker, direction, price, stop, tp, score, cq):
+    """Submit a bracket order to Alpaca (market entry + OCA stop/TP)."""
+    if not ALPACA_ENABLED:
+        return None
+    if _CQ_RANK.get(cq, 0) < _CQ_RANK.get(ALPACA_CQ_MIN, 0):
+        print(f"[ALPACA] Skipped {ticker} — CQ={cq} below min={ALPACA_CQ_MIN}", flush=True)
+        return None
+
+    client = _get_alpaca()
+    if not client:
+        return None
+
+    try:
+        shares = max(1, int(TRADE_SIZE_USD / price))
+        side   = OrderSide.BUY if direction == "BULL" else OrderSide.SELL
+
+        req = MarketOrderRequest(
+            symbol=ticker,
+            qty=shares,
+            side=side,
+            time_in_force=TimeInForce.DAY,
+            order_class=OrderClass.BRACKET,
+            take_profit=TakeProfitRequest(limit_price=round(tp, 2)),
+            stop_loss=StopLossRequest(stop_price=round(stop, 2)),
+        )
+        order = client.submit_order(req)
+        env = "PAPER" if ALPACA_PAPER else "LIVE"
+        print(
+            f"[ALPACA:{env}] ORDER {order.id} | {ticker} {direction} {shares}sh "
+            f"@ mkt | SL${stop:.2f} TP${tp:.2f} | score={score} CQ={cq}",
+            flush=True
+        )
+        return str(order.id)
+    except Exception as e:
+        print(f"[ALPACA] Order failed {ticker} {direction}: {e}", flush=True)
+        return None
 
 
 # ====================== STATE ======================
@@ -1357,6 +1431,57 @@ def api_outcomes():
         "open_trades": list(open_trades.values()),
         "outcomes":    outcomes[-200:],
     })
+
+
+@app.route('/api/alpaca')
+def api_alpaca():
+    if not ALPACA_ENABLED:
+        return jsonify({"enabled": False, "paper": ALPACA_PAPER})
+    client = _get_alpaca()
+    if not client:
+        return jsonify({"enabled": True, "paper": ALPACA_PAPER, "error": "Client unavailable"})
+    try:
+        account   = client.get_account()
+        positions = client.get_all_positions()
+        orders    = client.get_orders()
+        return jsonify({
+            "enabled": True,
+            "paper":   ALPACA_PAPER,
+            "cq_min":  ALPACA_CQ_MIN,
+            "size_usd": TRADE_SIZE_USD,
+            "account": {
+                "equity":          float(account.equity),
+                "buying_power":    float(account.buying_power),
+                "cash":            float(account.cash),
+                "portfolio_value": float(account.portfolio_value),
+                "daytrade_count":  int(account.daytrade_count),
+                "pattern_day_trader": account.pattern_day_trader,
+            },
+            "positions": [{
+                "symbol":          p.symbol,
+                "side":            p.side.value,
+                "qty":             float(p.qty),
+                "avg_entry":       float(p.avg_entry_price),
+                "current_price":   float(p.current_price)   if p.current_price   else None,
+                "unrealized_pl":   float(p.unrealized_pl)   if p.unrealized_pl   else None,
+                "unrealized_plpc": float(p.unrealized_plpc) if p.unrealized_plpc else None,
+                "market_value":    float(p.market_value)    if p.market_value    else None,
+            } for p in positions],
+            "orders": [{
+                "id":               str(o.id),
+                "symbol":           o.symbol,
+                "side":             o.side.value,
+                "qty":              float(o.qty) if o.qty else None,
+                "status":           o.status.value,
+                "submitted_at":     str(o.submitted_at) if o.submitted_at else None,
+                "filled_at":        str(o.filled_at)    if o.filled_at    else None,
+                "filled_avg_price": float(o.filled_avg_price) if o.filled_avg_price else None,
+                "order_class":      o.order_class.value if o.order_class else None,
+                "legs":             len(o.legs) if o.legs else 0,
+            } for o in orders[:25]],
+        })
+    except Exception as e:
+        return jsonify({"enabled": True, "paper": ALPACA_PAPER, "error": str(e)})
 
 
 @app.route('/test-daily-summary')
@@ -2926,6 +3051,7 @@ let vixData      = null;
 let econEvents   = [];
 let optionsData  = {};
 let tradesData   = {open_trades: [], outcomes: []};
+let alpacaData   = {enabled: false};
 let curTicker    = 'SPY';
 let curDir       = 'bull';
 let soundOn      = true;
@@ -4059,7 +4185,85 @@ function renderAnalytics() {
   })() : ''}
 </div>` : '';
 
-  panel.innerHTML = renderHeatmap() + keyLevelsHtml + tradesHtml + `
+  // ── Alpaca Execution panel ──────────────────────────────────────────────────
+  let alpacaHtml = '';
+  if (!alpacaData.enabled) {
+    alpacaHtml = `<div style="border-bottom:1px solid #1a1a1a;padding-bottom:10px;margin-bottom:10px">
+      <div class="section-title">Alpaca Execution</div>
+      <span style="color:#333;font-size:.78rem">Not configured — add ALPACA_API_KEY + ALPACA_SECRET_KEY to .env</span>
+    </div>`;
+  } else {
+    const env   = alpacaData.paper ? `<span style="color:#ffaa00;font-size:.62rem;border:1px solid #ffaa0044;padding:1px 5px;border-radius:2px">PAPER</span>`
+                                   : `<span style="color:#ff4444;font-size:.62rem;font-weight:bold;border:1px solid #ff444455;padding:1px 5px;border-radius:2px">LIVE</span>`;
+    const acct  = alpacaData.account || {};
+    const pos   = alpacaData.positions || [];
+    const ords  = alpacaData.orders   || [];
+    const err   = alpacaData.error;
+
+    const acctRow = (label, val, color) =>
+      val != null ? `<span style="font-size:.72rem;color:#555">${label}:</span> <span style="font-size:.72rem;color:${color||'#aaa'};margin-right:12px">${val}</span>` : '';
+
+    const acctHtml = acct.equity != null ? `
+      <div class="d-flex flex-wrap align-items-center gap-1 mb-2" style="margin-top:4px">
+        ${acctRow('Equity',   '$' + acct.equity.toLocaleString('en-US',{maximumFractionDigits:2}), '#fff')}
+        ${acctRow('BP',       '$' + acct.buying_power.toLocaleString('en-US',{maximumFractionDigits:0}), '#00ffcc')}
+        ${acctRow('Cash',     '$' + acct.cash.toLocaleString('en-US',{maximumFractionDigits:0}), '#aaa')}
+        ${acctRow('DT count', acct.daytrade_count, acct.daytrade_count >= 3 ? '#ff6666' : '#ffaa00')}
+        ${acctRow('Size/trade', '$' + (alpacaData.size_usd||0), '#777')}
+        ${acctRow('CQ min', alpacaData.cq_min, '#777')}
+      </div>` : (err ? `<div style="color:#ff6666;font-size:.76rem;margin:4px 0">${err}</div>` : '');
+
+    const posHtml = pos.length ? `
+      <div style="font-size:.68rem;color:#555;text-transform:uppercase;letter-spacing:.5px;margin-bottom:3px">Open Positions (${pos.length})</div>
+      ${pos.map(p => {
+        const side  = p.side === 'long' ? {c:'#00ff88', lbl:'LONG'}  : {c:'#ff6666', lbl:'SHORT'};
+        const plClr = p.unrealized_pl == null ? '#555' : p.unrealized_pl >= 0 ? '#00ff88' : '#ff6666';
+        const plPct = p.unrealized_plpc != null ? ` (${(p.unrealized_plpc*100).toFixed(2)}%)` : '';
+        const plStr = p.unrealized_pl  != null ? `${p.unrealized_pl>=0?'+':''}$${p.unrealized_pl.toFixed(2)}${plPct}` : '–';
+        return `<div style="font-size:.73rem;padding:3px 0;border-bottom:1px solid #0d0d0d;display:flex;gap:8px;flex-wrap:wrap">
+          <span style="color:${side.c};font-weight:700;min-width:44px">${side.lbl}</span>
+          <span style="font-weight:600;min-width:40px">${p.symbol}</span>
+          <span style="color:#555">${p.qty}sh</span>
+          <span style="color:#666">@ $${parseFloat(p.avg_entry).toFixed(2)}</span>
+          ${p.current_price ? `<span style="color:#aaa">now $${parseFloat(p.current_price).toFixed(2)}</span>` : ''}
+          <span style="color:${plClr};font-weight:600;margin-left:auto">${plStr}</span>
+        </div>`;
+      }).join('')}` : `<div style="color:#333;font-size:.76rem;margin-bottom:4px">No open positions</div>`;
+
+    const ordStatusClr = s => ({filled:'#00ff88', partially_filled:'#aaff00', new:'#ffaa00', pending_new:'#ffaa00', accepted:'#ffaa00', canceled:'#555', expired:'#333'}[s] || '#777');
+    const ordHtml = ords.length ? `
+      <div style="font-size:.68rem;color:#555;text-transform:uppercase;letter-spacing:.5px;margin:6px 0 3px">Recent Orders</div>
+      <table style="width:100%;border-collapse:collapse">
+        <thead><tr style="color:#333;font-size:.58rem;text-transform:uppercase">
+          <th style="padding:1px 6px;text-align:left">Symbol</th>
+          <th style="padding:1px 4px">Side</th>
+          <th style="padding:1px 4px;text-align:right">Qty</th>
+          <th style="padding:1px 4px">Status</th>
+          <th style="padding:1px 6px;text-align:right">Fill $</th>
+          <th style="padding:1px 4px">Class</th>
+        </tr></thead>
+        <tbody>${ords.map(o => {
+          const sc = o.side === 'buy' ? '#00ff88' : '#ff6666';
+          const stc = ordStatusClr(o.status);
+          const fill = o.filled_avg_price ? '$' + parseFloat(o.filled_avg_price).toFixed(2) : '–';
+          return `<tr style="border-bottom:1px solid #0a0a0a;font-size:.7rem">
+            <td style="padding:2px 6px;font-weight:600">${o.symbol}</td>
+            <td style="padding:2px 4px;color:${sc};text-align:center">${o.side.toUpperCase()}</td>
+            <td style="padding:2px 4px;color:#666;text-align:right">${o.qty||'–'}</td>
+            <td style="padding:2px 4px;color:${stc}">${o.status}${o.legs>0?` [${o.legs}L]`:''}</td>
+            <td style="padding:2px 6px;color:#777;text-align:right">${fill}</td>
+            <td style="padding:2px 4px;color:#444;font-size:.62rem">${o.order_class||'simple'}</td>
+          </tr>`;
+        }).join('')}</tbody>
+      </table>` : `<div style="color:#333;font-size:.76rem">No recent orders</div>`;
+
+    alpacaHtml = `<div style="border-bottom:1px solid #1a1a1a;padding-bottom:10px;margin-bottom:10px">
+      <div class="section-title d-flex align-items-center gap-2">Alpaca Execution ${env}</div>
+      ${acctHtml}${posHtml}${ordHtml}
+    </div>`;
+  }
+
+  panel.innerHTML = renderHeatmap() + alpacaHtml + keyLevelsHtml + tradesHtml + `
 <div class="row g-2">
   <div class="col-12">
     <div class="d-flex flex-wrap gap-2" style="font-size:.78rem">
@@ -4144,12 +4348,14 @@ function renderLog() {
 // ── Main poll loop ────────────────────────────────────────────────────────────
 async function update() {
   try {
-    const [res, resT] = await Promise.all([
+    const [res, resT, resA] = await Promise.all([
       fetch('/api/status'),
       fetch('/api/outcomes'),
+      fetch('/api/alpaca'),
     ]);
     const data = await res.json();
     const tdata = resT.ok ? await resT.json() : {open_trades:[], outcomes:[]};
+    if (resA.ok) { try { alpacaData = await resA.json(); } catch(_) {} }
     allData      = data.tickers     || {};
     signalLog    = data.signal_log  || [];
     vixData      = data.vix         || null;

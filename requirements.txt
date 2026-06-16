@@ -6,3 +6,4 @@ flask
 requests
 waitress
 yfinance
+alpaca-py
