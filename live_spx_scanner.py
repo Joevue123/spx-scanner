@@ -36,7 +36,7 @@ WATCHLIST             = ["SPY", "QQQ", "IWM", "NVDA", "AAPL"]
 SIGNAL_LOG_FILE       = "/tmp/signal_log.json"
 CSV_LOG_FILE          = "/tmp/signals.csv"
 HISTORY_FILE_TMPL     = "/tmp/score_history_{}.json"
-MAX_SCORE             = 27       # 20 + 5 institutional + 2 pivot/key-level signals per direction
+MAX_SCORE             = 29       # 20 + 5 institutional + 2 pivot + 2 candlestick/regime signals per direction
 ALERT_COOLDOWN_SECS   = 900
 VOLUME_SPIKE_MULT     = 3.0
 ALERT_SCORE_THRESHOLD = 9
@@ -341,6 +341,139 @@ def _compute_max_pain(calls, puts):
         return float(best)
     except Exception:
         return None
+
+
+# ====================== CANDLESTICK & REGIME DETECTION (Phase 10) =========
+
+def detect_candle_patterns(df_1m):
+    """
+    Detect key reversal and continuation candlestick patterns on the most
+    recent bars.  Uses pure OHLC math — no external library needed.
+    Checks single-bar, two-bar, and three-bar patterns; the strongest
+    match wins (later patterns overwrite earlier ones, so three-bar > two-bar > one-bar).
+    Returns (bull_pattern_name, bear_pattern_name) — either can be None.
+    """
+    if df_1m is None or len(df_1m) < 4:
+        return None, None
+    o = df_1m['Open'].values.astype(float)
+    h = df_1m['High'].values.astype(float)
+    l = df_1m['Low'].values.astype(float)
+    c = df_1m['Close'].values.astype(float)
+
+    bull_pat = bear_pat = None
+
+    # ── Single-bar: check completed bar (-2) and current bar (-1) ──────────
+    for i in (-2, -1):
+        body       = abs(c[i] - o[i])
+        rng        = h[i] - l[i]
+        if rng < 1e-9:
+            continue
+        up_wick    = h[i] - max(c[i], o[i])
+        lo_wick    = min(c[i], o[i]) - l[i]
+        is_bull    = c[i] >= o[i]
+
+        # Hammer / Inverted Hammer (bull reversal)
+        if lo_wick >= 2 * max(body, 1e-9) and up_wick <= body * 0.5:
+            bull_pat = "Hammer"
+        if up_wick >= 2 * max(body, 1e-9) and lo_wick <= body * 0.5 and is_bull:
+            bull_pat = "Inv. Hammer"
+
+        # Shooting Star / Hanging Man (bear reversal)
+        if up_wick >= 2 * max(body, 1e-9) and lo_wick <= body * 0.5 and not is_bull:
+            bear_pat = "Shooting Star"
+        if lo_wick >= 2 * max(body, 1e-9) and up_wick <= body * 0.5 and not is_bull:
+            bear_pat = "Hanging Man"
+
+        # Strong Marubozu bars (continuation)
+        if is_bull  and body >= 0.85 * rng:
+            bull_pat = "Bull Marubozu"
+        if not is_bull and body >= 0.85 * rng:
+            bear_pat = "Bear Marubozu"
+
+        # Doji variants
+        if body < 0.08 * rng:
+            if lo_wick > 2.5 * up_wick:
+                bull_pat = "Dragonfly Doji"
+            elif up_wick > 2.5 * lo_wick:
+                bear_pat = "Gravestone Doji"
+
+    # ── Two-bar patterns: bars [-3], [-2] ──────────────────────────────────
+    if len(df_1m) >= 3:
+        po, pc = o[-3], c[-3]
+        co, cc = o[-2], c[-2]
+        p_bear = pc < po;  p_bull = pc > po
+        c_bull = cc > co;  c_bear = cc < co
+
+        if p_bear and c_bull and co <= pc and cc >= po:
+            bull_pat = "Bullish Engulfing"
+        if p_bull and c_bear and co >= pc and cc <= po:
+            bear_pat = "Bearish Engulfing"
+
+        # Piercing Line: bear bar then bull bar opening below prev low, closing above prev midpoint
+        if p_bear and c_bull and co < l[-3] and cc > (po + pc) / 2:
+            bull_pat = "Piercing Line"
+        # Dark Cloud Cover: bull bar then bear bar opening above prev high, closing below prev midpoint
+        if p_bull and c_bear and co > h[-3] and cc < (po + pc) / 2:
+            bear_pat = "Dark Cloud Cover"
+
+        # Tweezer Bottom / Top
+        if abs(l[-3] - l[-2]) < 0.05 * (h[-2] - l[-2]) and c_bull:
+            bull_pat = "Tweezer Bottom"
+        if abs(h[-3] - h[-2]) < 0.05 * (h[-2] - l[-2]) and c_bear:
+            bear_pat = "Tweezer Top"
+
+    # ── Three-bar patterns: bars [-4], [-3], [-2] ──────────────────────────
+    if len(df_1m) >= 4:
+        b1o, b1c = o[-4], c[-4]
+        b2o, b2c = o[-3], c[-3]
+        b3o, b3c = o[-2], c[-2]
+        b1bd = abs(b1c - b1o)
+        b2bd = abs(b2c - b2o)
+
+        # Morning Star
+        if (b1c < b1o and b2bd < 0.35 * b1bd
+                and b3c > b3o and b3c > (b1o + b1c) / 2):
+            bull_pat = "Morning Star"
+        # Evening Star
+        if (b1c > b1o and b2bd < 0.35 * b1bd
+                and b3c < b3o and b3c < (b1o + b1c) / 2):
+            bear_pat = "Evening Star"
+        # Three White Soldiers
+        if (b1c > b1o and b2c > b2o and b3c > b3o
+                and b2c > b1c and b3c > b2c
+                and b2o > b1o and b3o > b2o):
+            bull_pat = "Three White Soldiers"
+        # Three Black Crows
+        if (b1c < b1o and b2c < b2o and b3c < b3o
+                and b2c < b1c and b3c < b2c
+                and b2o < b1o and b3o < b2o):
+            bear_pat = "Three Black Crows"
+
+    return bull_pat, bear_pat
+
+
+def detect_market_regime(adx_val, dmp_val, dmn_val, price,
+                         bb_upper_val, bb_lower_val):
+    """
+    Classify the current market into one of five regime states:
+      trending_up   — ADX>25, DM+ dominant → directional bull
+      trending_down — ADX>25, DM- dominant → directional bear
+      breakout_up   — ADX weak but price above upper BB → early bull move
+      breakout_down — ADX weak but price below lower BB → early bear move
+      ranging       — ADX<20, price inside BBands → mean-reversion mode
+    Returns a string key (or 'unknown' when data is missing).
+    """
+    if not _valid(adx_val):
+        return 'unknown'
+    if adx_val > 25 and _valid(dmp_val) and _valid(dmn_val):
+        return 'trending_up' if dmp_val > dmn_val else 'trending_down'
+    if adx_val < 20:
+        if _valid(bb_upper_val) and price > bb_upper_val:
+            return 'breakout_up'
+        if _valid(bb_lower_val) and price < bb_lower_val:
+            return 'breakout_down'
+        return 'ranging'
+    return 'neutral'
 
 
 # ====================== INSTITUTIONAL FLOW DETECTION (Phase 8) ========
@@ -844,6 +977,10 @@ _blank_ticker = lambda t: {
     "pivot_s1":    None, "pivot_s2": None, "pivot_s3": None,
     "prev_high":   None, "prev_low": None, "prev_close": None,
     "max_pain":    None,
+    # Phase 10
+    "candle_bull_pat": None,
+    "candle_bear_pat": None,
+    "regime":          "unknown",
     "bull_signals": {},
     "bear_signals": {},
     "history":      load_history(t),
@@ -1313,6 +1450,14 @@ def compute_signals(df_1m, df_5m, ticker=None):
     pdh_str  = f"${prev_high:.2f}" if prev_high else "No data"
     pdl_str  = f"${prev_low:.2f}"  if prev_low  else "No data"
 
+    # ── Phase 10: Candlestick patterns + market regime ────────────────────────
+    candle_bull_pat, candle_bear_pat = detect_candle_patterns(df_1m)
+    regime = detect_market_regime(adx_val, dmp_val, dmn_val, price,
+                                  bb_upper_val, bb_lower_val)
+    regime_bull_ok = regime in ('trending_up',   'breakout_up')
+    regime_bear_ok = regime in ('trending_down', 'breakout_down')
+    regime_label   = regime.replace('_', ' ').title() if regime else "Unknown"
+
     # ── Signal builder helper ──────────────────────────────────────────────────
     def bs(label, pts, active, value, tf1=None, tf5=None):
         d = {"label": label, "points": pts, "active": bool(active), "value": value}
@@ -1368,6 +1513,9 @@ def compute_signals(df_1m, df_5m, ticker=None):
         # ── Pivot / key levels (Phase 9) ──────────────────────────────────────
         "pivot_bull":  bs("Above Pivot PP",   1, pivot_bull_ok,           pp_str),
         "pdh_break":   bs("PDH Breakout",     1, pdh_break_ok,            pdh_str),
+        # ── Candle patterns + regime (Phase 10) ───────────────────────────────
+        "candle_bull": bs("Candle Pattern ↑", 1, candle_bull_pat is not None, candle_bull_pat or "None"),
+        "regime_bull": bs("Regime: Bull",     1, regime_bull_ok,          regime_label),
     }
     bull_score = sum(s['points'] for s in bull.values() if s['active'])
 
@@ -1417,6 +1565,9 @@ def compute_signals(df_1m, df_5m, ticker=None):
         # ── Pivot / key levels (Phase 9) ──────────────────────────────────────
         "pivot_bear":  bs("Below Pivot PP",   1, pivot_bear_ok,           pp_str),
         "pdl_break":   bs("PDL Breakdown",    1, pdl_break_ok,            pdl_str),
+        # ── Candle patterns + regime (Phase 10) ───────────────────────────────
+        "candle_bear": bs("Candle Pattern ↓", 1, candle_bear_pat is not None, candle_bear_pat or "None"),
+        "regime_bear": bs("Regime: Bear",     1, regime_bear_ok,          regime_label),
     }
     bear_score = sum(s['points'] for s in bear.values() if s['active'])
 
@@ -1464,6 +1615,10 @@ def compute_signals(df_1m, df_5m, ticker=None):
         "pivot_pp":   pp,    "pivot_r1": r1,   "pivot_r2": r2,   "pivot_r3": r3,
         "pivot_s1":   s1,    "pivot_s2": s2,   "pivot_s3": s3,
         "prev_high":  prev_high,  "prev_low": prev_low,  "prev_close": prev_close,
+        # Phase 10
+        "candle_bull_pat": candle_bull_pat,
+        "candle_bear_pat": candle_bear_pat,
+        "regime":          regime,
     }
 
 
@@ -1721,6 +1876,10 @@ async def scan_ticker(client, ticker, market_open):
         "prev_high":  result['prev_high'], "prev_low": result['prev_low'],
         "prev_close": result['prev_close'],
         "max_pain":   options_data.get(ticker, {}).get('max_pain'),
+        # Phase 10
+        "candle_bull_pat": result['candle_bull_pat'],
+        "candle_bear_pat": result['candle_bear_pat'],
+        "regime":          result['regime'],
         # PCR from options_data (updated by fetch_options_flow, not per-scan)
         "pcr":          options_data.get(ticker, {}).get("pcr"),
         "pcr_oi":       options_data.get(ticker, {}).get("pcr_oi"),
@@ -1903,6 +2062,10 @@ DASHBOARD_HTML = """<!DOCTYPE html>
   .sig-card.inst.active .sig-label{color:#ffd700}
   .div-warn{background:#330d0d;border:1px solid #ff4444;border-radius:6px;padding:6px 10px;font-size:.76rem;color:#ff8888;margin-bottom:6px}
   .div-absorb{background:#0d2200;border:1px solid #00ff88;border-radius:6px;padding:6px 10px;font-size:.76rem;color:#88ff88;margin-bottom:6px}
+  /* Regime badges */
+  .regime-trending-up{color:#00ff88}.regime-trending-down{color:#ff6666}
+  .regime-breakout-up{color:#00ffcc}.regime-breakout-down{color:#ff9966}
+  .regime-ranging{color:#888}.regime-neutral{color:#666}.regime-unknown{color:#444}
   .sound-btn{background:#111;border:1px solid #333;color:#888;padding:3px 10px;border-radius:6px;cursor:pointer;font-size:.76rem}
   .sound-btn.on{border-color:#00ffcc;color:#00ffcc}
   /* Risk panel */
@@ -2164,6 +2327,7 @@ function renderTickerRow() {
           ${d.trend_15m ? `<span style="color:${d.trend_15m==='bull'?'#00ff88':'#ff6666'}">15m ${d.trend_15m==='bull'?'▲':'▼'}</span>` : ''}
           ${d.trend_1h  ? `<span class="ms-1" style="color:${d.trend_1h==='bull'?'#00ff88':'#ff6666'}">1h ${d.trend_1h==='bull'?'▲':'▼'}</span>` : ''}
           ${d.tod_ok === false ? '<span class="ms-1" style="color:#ffaa00">⏸ TOD</span>' : ''}
+          ${d.regime && d.regime !== 'unknown' ? `<span class="ms-1 regime-${d.regime}">${{trending_up:'↗Trend',trending_down:'↘Trend',breakout_up:'⚡BO↑',breakout_down:'⚡BO↓',ranging:'↔Range',neutral:'~'}[d.regime]||d.regime}</span>` : ''}
         </div>
         <div class="bar-wrap mt-1">
           <div class="bar" style="width:${Math.min(score/MAX_SCORE*100,100)}%;background:${scoreColor(score)}"></div>
@@ -2226,6 +2390,26 @@ function renderContextRow() {
   if (!d) return;
   const row = document.getElementById('ctx-row');
   let html = '';
+
+  // Phase 10: Market regime badge (always first)
+  if (d.regime && d.regime !== 'unknown') {
+    const regimeMeta = {
+      trending_up:   {cls:'ctx-bull',  icon:'↗', label:'Trending Up'},
+      trending_down: {cls:'ctx-bear',  icon:'↘', label:'Trending Down'},
+      breakout_up:   {cls:'ctx-bull',  icon:'⚡', label:'Breakout ↑'},
+      breakout_down: {cls:'ctx-bear',  icon:'⚡', label:'Breakout ↓'},
+      ranging:       {cls:'ctx-neutral',icon:'↔', label:'Ranging'},
+      neutral:       {cls:'ctx-neutral',icon:'~', label:'Neutral'},
+    };
+    const rm = regimeMeta[d.regime] || {cls:'ctx-neutral', icon:'?', label:d.regime};
+    html += `<span class="ctx-badge ${rm.cls}" title="Market regime (ADX + BBands)">${rm.icon} ${rm.label}</span>`;
+  }
+  // Phase 10: Active candle pattern
+  const cpat = curDir === 'bull' ? d.candle_bull_pat : d.candle_bear_pat;
+  if (cpat) {
+    const cpCls = curDir === 'bull' ? 'ctx-bull' : 'ctx-bear';
+    html += `<span class="ctx-badge ${cpCls}" title="Candlestick pattern on recent bars">🕯 ${cpat}</span>`;
+  }
 
   // Pre-market gap (shown before/at open)
   if (d.pm_gap_pct != null) {
@@ -2656,6 +2840,9 @@ function renderAnalytics() {
           <td style="padding:3px 6px;color:#fff;font-weight:700">Current</td>
           <td style="text-align:right;padding:3px 6px;color:#fff;font-weight:700">$${kd.price.toFixed(2)}</td>
         </tr>` : ''}
+        ${kd.regime && kd.regime !== 'unknown' ? `<tr><td style="color:#555;padding:2px 6px">Regime</td><td style="text-align:right;padding:2px 6px;color:#aaa">${kd.regime.replace(/_/g,' ')}</td></tr>` : ''}
+        ${kd.candle_bull_pat ? `<tr><td style="color:#555;padding:2px 6px">Bull Pat</td><td style="text-align:right;padding:2px 6px;color:#00ff88">${kd.candle_bull_pat}</td></tr>` : ''}
+        ${kd.candle_bear_pat ? `<tr><td style="color:#555;padding:2px 6px">Bear Pat</td><td style="text-align:right;padding:2px 6px;color:#ff6666">${kd.candle_bear_pat}</td></tr>` : ''}
       </table>
     </div>
   </div>
