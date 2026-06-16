@@ -22,7 +22,9 @@ from polygon import RESTClient
 from waitress import serve as _waitress_serve
 from alpaca.trading.client import TradingClient
 from alpaca.data.historical import StockHistoricalDataClient
-from alpaca.data.requests import StockLatestTradeRequest
+from alpaca.data.requests import StockLatestTradeRequest, StockBarsRequest
+from alpaca.data.timeframe import TimeFrame
+from alpaca.data.enums import DataFeed
 from alpaca.trading.requests import (
     MarketOrderRequest, TakeProfitRequest, StopLossRequest, GetOrdersRequest
 )
@@ -1675,26 +1677,26 @@ def fetch_aggs(client, ticker, multiplier, days, limit=500):
     try:
         end   = datetime.now(timezone.utc)
         start = end - timedelta(days=days)
-        aggs  = list(itertools.islice(
-            client.get_aggs(
-                ticker=ticker,
-                multiplier=multiplier,
-                timespan="minute",
-                from_=start.strftime("%Y-%m-%d"),
-                to=end.strftime("%Y-%m-%d"),
-                limit=limit,
-            ), limit
-        ))
-        if not aggs:
+        req   = StockBarsRequest(
+            symbol_or_symbols=ticker,
+            timeframe=TimeFrame.Minute,
+            start=start,
+            end=end,
+            limit=limit,
+            feed=DataFeed.IEX,
+        )
+        bars     = client.get_stock_bars(req)
+        bar_list = bars[ticker]
+        if not bar_list:
             return None
         df = pd.DataFrame([{
-            'Open':   a.open,
-            'High':   a.high,
-            'Low':    a.low,
-            'Close':  a.close,
-            'Volume': a.volume,
-            'ts':     a.timestamp,
-        } for a in aggs])
+            'Open':   b.open,
+            'High':   b.high,
+            'Low':    b.low,
+            'Close':  b.close,
+            'Volume': b.volume,
+            'ts':     int(b.timestamp.timestamp() * 1000),
+        } for b in bar_list])
         df['date'] = pd.to_datetime(df['ts'], unit='ms', utc=True).dt.date
         return df
     except Exception:
@@ -2890,11 +2892,10 @@ async def scan_ticker(client, ticker, market_open):
 
 async def main():
     print("SCANNER STARTED", flush=True)
-    if not POLYGON_API_KEY:
-        print("ERROR: POLYGON_API_KEY not set", flush=True)
+    client = _get_alpaca_data()
+    if client is None:
+        print("ERROR: Alpaca data client unavailable — check ALPACA_API_KEY/ALPACA_SECRET_KEY", flush=True)
         return
-
-    client          = RESTClient(POLYGON_API_KEY)
     loop            = asyncio.get_running_loop()
     _econ_last      = None
     _opts_last      = None
@@ -4801,7 +4802,11 @@ async def _run_backtest():
     # Wait for the scanner's first cycle to complete before hammering Polygon
     await asyncio.sleep(90)
 
-    client     = RESTClient(POLYGON_API_KEY)
+    client = _get_alpaca_data()
+    if client is None:
+        _backtest_state["status"]   = "error"
+        _backtest_state["progress"] = "Alpaca data client unavailable"
+        return
     all_trades: list = []
 
     try:
