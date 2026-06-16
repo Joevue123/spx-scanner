@@ -51,6 +51,7 @@ ALERT_COOLDOWN_SECS   = 900
 VOLUME_SPIKE_MULT     = 3.0
 ALERT_SCORE_THRESHOLD = 22      # ~22% conviction floor (was 9/42)
 LOG_SCORE_THRESHOLD   = 14      # ~14% log floor (was 6/42)
+REV_SCORE_THRESHOLD   = 3       # need 3/6 reversal signals to alert
 
 # ── Weighted scoring architecture ─────────────────────────────────────────────
 CATEGORY_WEIGHTS = {
@@ -1072,7 +1073,8 @@ def detect_rsi_divergence(df):
 
 # ====================== NOTIFICATIONS ======================
 
-_last_alert_times = {}
+_last_alert_times     = {}
+_last_rev_alert_times = {}
 
 
 def _send_discord(ticker, message):
@@ -1428,6 +1430,9 @@ _blank_ticker = lambda t: {
     # Phase 13
     "bull_breakdown": {}, "bear_breakdown": {},
     "bull_cq": "WEAK",   "bear_cq": "WEAK",
+    "rev_score":    0,
+    "rev_signals":  {},
+    "vwap_val":     None,
     "bull_signals": {},
     "bear_signals": {},
     "history":      load_history(t),
@@ -2476,7 +2481,52 @@ def compute_signals(df_1m, df_5m, ticker=None, pm_high=None, pm_low=None):
         "bear_breakdown": bear_breakdown,
         "bull_cq":        bull_breakdown["cq"],
         "bear_cq":        bear_breakdown["cq"],
+        # Reversal signals
+        "vwap_val":          vwap_val,
+        "stochrsi_k_prev":   stochrsi_k_prev,
+        "stochrsi_d_prev":   stochrsi_d_prev,
+        "fib_resist_ok":     fib_at_zone and price <= (fib_lv_val or price + 1),
     }
+
+
+def compute_reversal_score(result: dict, opts: dict) -> "tuple[int, dict]":
+    """Score a bear exhaustion/reversal setup (0-6 binary signals)."""
+    price      = result.get("price", 0) or 0
+    vwap_dist  = result.get("vwap_dist_atr")
+    rsi_div    = result.get("rsi_div")
+    vol_div    = result.get("vol_delta_div")
+    fib_ok     = result.get("fib_resist_ok", False)
+    candle_pat = result.get("candle_bear_pat")
+    k          = result.get("stochrsi_k")
+    d          = result.get("stochrsi_d")
+    k_prev     = result.get("stochrsi_k_prev")
+    d_prev     = result.get("stochrsi_d_prev")
+    atr        = result.get("atr") or 0
+    top_calls  = opts.get("top_call_strikes", [])
+
+    vwap_ext   = bool(vwap_dist is not None and vwap_dist > 2.0)
+    rsi_div_ok = rsi_div == "bear"
+    vol_div_ok = vol_div == "bear"
+    call_wall  = bool(top_calls and atr > 0 and price > 0 and
+                      any(abs(price - (s.get("strike", 0) if isinstance(s, dict) else s)) <= 0.5 * atr for s in top_calls[:3]))
+    fib_wall   = bool(fib_ok or call_wall)
+    REV_CANDLES = {"Shooting Star", "Evening Star", "Gravestone Doji", "Bearish Engulfing"}
+    candle_rev = candle_pat in REV_CANDLES
+    stochrsi_ob = bool(
+        k is not None and d is not None and
+        k_prev is not None and d_prev is not None and
+        k < d and k_prev >= d_prev and k_prev > 80
+    )
+    signals = {
+        "vwap_ext":    vwap_ext,
+        "rsi_div":     rsi_div_ok,
+        "vol_div":     vol_div_ok,
+        "fib_wall":    fib_wall,
+        "candle_rev":  candle_rev,
+        "stochrsi_ob": stochrsi_ob,
+    }
+    score = sum(1 for v in signals.values() if v)
+    return score, signals
 
 
 def fetch_econ_calendar():
@@ -2741,6 +2791,10 @@ async def scan_ticker(client, ticker, market_open):
     bull_score_peak = max(bull_score_peak, int(bull_score))
     bear_score_peak = max(bear_score_peak, int(bear_score))
 
+    # Reversal scoring
+    rev_opts    = options_data.get(ticker, {})
+    rev_score, rev_signals = compute_reversal_score(result, rev_opts)
+
     dashboard_data[ticker].update({
         "price":        price,
         "bull_score":   bull_score,
@@ -2841,6 +2895,10 @@ async def scan_ticker(client, ticker, market_open):
         "bull_signals": result['bull_signals'],
         "bear_signals": result['bear_signals'],
         "history":      history,
+        # Reversal
+        "rev_score":    rev_score,
+        "rev_signals":  rev_signals,
+        "vwap_val":     result.get("vwap_val"),
     })
 
     cq_now = result.get('bull_cq' if direction != 'BEAR' else 'bear_cq', 'WEAK')
@@ -2876,6 +2934,28 @@ async def scan_ticker(client, ticker, market_open):
         tp   = result['bull_tp']   if direction != "BEAR" else result['bear_tp']
         send_notifications(ticker, price, bull_score, bear_score, direction,
                            vol_spike, result['atr'], stop, tp, cq=cq_now)
+
+    # Reversal alert — separate cooldown, fired independently of bull/bear alerts
+    if market_open and rev_score >= REV_SCORE_THRESHOLD:
+        global _last_rev_alert_times
+        _now_rev = datetime.now(timezone.utc)
+        _last_rev = _last_rev_alert_times.get(ticker)
+        if not _last_rev or (_now_rev - _last_rev).total_seconds() >= ALERT_COOLDOWN_SECS:
+            _last_rev_alert_times[ticker] = _now_rev
+            _vwap = result.get("vwap_val")
+            _atr  = result.get("atr") or 0
+            _sh   = result.get("session_high") or price
+            _rev_entry = price
+            _rev_sl    = round(_sh + 0.25 * _atr, 2) if _atr else round(price * 1.005, 2)
+            _rev_tp    = round((_rev_entry + _vwap) / 2, 2) if _vwap else round(price * 0.99, 2)
+            _active = [k for k, v in rev_signals.items() if v]
+            _msg = (
+                f"🔄 **REVERSAL SETUP** | {ticker} | Score {rev_score}/6\n"
+                f"Entry: ${_rev_entry:.2f} | SL: ${_rev_sl:.2f} | TP: ${_rev_tp:.2f}\n"
+                f"Active signals: {', '.join(_active)}"
+            )
+            _send_discord(ticker, _msg)
+            print(f"[REVERSAL] {ticker} score={rev_score}/6 signals={_active}", flush=True)
 
     if market_open and vol_spike:
         print(f"⚡ VOLUME SPIKE [{ticker}]: {result['vol_ratio']}x avg", flush=True)
@@ -3086,6 +3166,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         <button class="tab-btn active" id="tab-bull" onclick="setTab('bull')">🔼 Bull</button>
         <button class="tab-btn"        id="tab-bear" onclick="setTab('bear')">🔽 Bear</button>
         <button class="tab-btn"        id="tab-stats" onclick="setTab('analytics')">📊 Stats</button>
+        <button class="tab-btn"        id="tab-rev"   onclick="setTab('reversal')">🔄 Rev</button>
       </div>
       <span id="vol-spike-badge" class="vol-spike d-none">⚡ VOL SPIKE</span>
     </div>
@@ -3107,6 +3188,8 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 
     <!-- Analytics Panel -->
     <div id="analytics-panel" class="d-none"></div>
+    <!-- Reversal Panel -->
+    <div id="rev-panel" class="d-none"></div>
   </div>
 
   <!-- Charts + Alerts Row -->
@@ -3362,6 +3445,7 @@ function renderTickerRow() {
         </div>
         <div style="margin-top:3px;opacity:.75">${sparklineSvg(d.history)}</div>
         <div style="font-size:.57rem;color:#2a2a2a;margin-top:1px">Peak ▲${d.bull_score_peak||0} ▼${d.bear_score_peak||0}</div>
+        ${(d.rev_score||0)>=3?`<div style="font-size:.6rem;color:${(d.rev_score||0)>=4?'#ff4444':'#ffaa00'};margin-top:1px">🔄 Rev ${d.rev_score}/6</div>`:''}
       </div>`;
     row.appendChild(col);
   }
@@ -3397,16 +3481,24 @@ function setTab(tab) {
   curTab = tab;
   const sigSec  = document.getElementById('signals-section');
   const anaSec  = document.getElementById('analytics-panel');
+  const revSec  = document.getElementById('rev-panel');
+  sigSec.classList.add('d-none');
+  anaSec.classList.add('d-none');
+  revSec.classList.add('d-none');
+  document.getElementById('tab-bull').className  = 'tab-btn';
+  document.getElementById('tab-bear').className  = 'tab-btn';
+  document.getElementById('tab-stats').className = 'tab-btn';
+  document.getElementById('tab-rev').className   = 'tab-btn';
   if (tab === 'analytics') {
-    sigSec.classList.add('d-none');
     anaSec.classList.remove('d-none');
-    document.getElementById('tab-bull').className  = 'tab-btn';
-    document.getElementById('tab-bear').className  = 'tab-btn';
     document.getElementById('tab-stats').className = 'tab-btn active';
     renderAnalytics();
+  } else if (tab === 'reversal') {
+    revSec.classList.remove('d-none');
+    document.getElementById('tab-rev').className = 'tab-btn active';
+    renderRevPanel();
   } else {
     sigSec.classList.remove('d-none');
-    anaSec.classList.add('d-none');
     curDir = tab;
     setDir(tab);
     renderSignals();
@@ -3415,6 +3507,57 @@ function setTab(tab) {
 }
 
 // ── Context row (Gap + ORB + Pre-market Gap) ─────────────────────────────────
+function renderRevPanel() {
+  const panel = document.getElementById('rev-panel');
+  const d = allData[curTicker];
+  if (!d) { panel.innerHTML = '<p style="color:#555">No data</p>'; return; }
+  const rs = d.rev_score || 0;
+  const rv = d.rev_signals || {};
+  const SIG_META = {
+    vwap_ext:    { label: "VWAP Extension", desc: "Price > 2 ATR above VWAP" },
+    rsi_div:     { label: "RSI Divergence",  desc: "Bearish RSI divergence active" },
+    vol_div:     { label: "Vol Delta Div",   desc: "Volume delta diverging bearish" },
+    fib_wall:    { label: "Fib/Call Wall",   desc: "Price at fib resistance or call strike" },
+    candle_rev:  { label: "Reversal Candle", desc: "Shooting Star / Evening Star / Engulf ↓" },
+    stochrsi_ob: { label: "StochRSI X-dn",  desc: "K crossed below D from overbought (>80)" },
+  };
+  const barW = Math.round(rs / 6 * 100);
+  const barClr = rs >= 4 ? "#ff4444" : rs >= 3 ? "#ffaa00" : "#555";
+  let html = `
+    <div style="margin-bottom:10px">
+      <div style="display:flex;align-items:center;gap:8px;margin-bottom:4px">
+        <span style="color:#ccc;font-size:.8rem">Reversal Score</span>
+        <span style="color:${barClr};font-weight:bold;font-size:1rem">${rs}/6</span>
+      </div>
+      <div style="height:6px;background:#1a1a1a;border-radius:3px">
+        <div style="height:6px;width:${barW}%;background:${barClr};border-radius:3px;transition:width .3s"></div>
+      </div>
+    </div>
+    <div class="row g-2">
+  `;
+  for (const [key, meta] of Object.entries(SIG_META)) {
+    const active = rv[key] === true;
+    const clr = active ? "#ff6666" : "#333";
+    const icon = active ? "🔴" : "⚫";
+    html += `
+      <div class="col-6 col-md-4">
+        <div style="background:${active?"#2a0808":"#111"};border:1px solid ${active?"#ff4444":"#222"};
+             border-radius:6px;padding:8px;font-size:.75rem">
+          <div>${icon} <strong style="color:${active?"#ff9999":"#555"}">${meta.label}</strong></div>
+          <div style="color:#444;font-size:.68rem;margin-top:2px">${meta.desc}</div>
+        </div>
+      </div>`;
+  }
+  html += "</div>";
+  if (d.vwap_val) {
+    const vd = d.vwap_dist_atr;
+    const distStr = vd!=null ? " | Dist: "+(vd>0?"+":"")+vd.toFixed(2)+"xATR" : "";
+    html += "<div style=\"margin-top:8px;font-size:.72rem;color:#555\">" +
+      "VWAP: $" + d.vwap_val.toFixed(2) + distStr + "</div>";
+  }
+  panel.innerHTML = html;
+}
+
 function renderContextRow() {
   const d = allData[curTicker];
   if (!d) return;
@@ -4566,6 +4709,7 @@ async function update() {
 
     renderTickerRow();
     if (curTab === 'analytics') renderAnalytics();
+    else if (curTab === 'reversal') renderRevPanel();
     else { renderSignals(); renderRiskPanel(); }
     renderContextRow();
     renderAlerts();
@@ -4694,6 +4838,10 @@ def _bt_simulate_ticker(ticker: str, df_full: pd.DataFrame) -> list:
         bull_s = res.get("bull_score", 0)
         bear_s = res.get("bear_score", 0)
 
+        # Reversal setup — needs 3+ signals; fires a BEAR trade with special SL/TP
+        _rev_score, _rev_sigs = compute_reversal_score(res, {})
+        _is_reversal = _rev_score >= REV_SCORE_THRESHOLD
+
         # Decide direction: higher score wins; skip if both below log threshold
         if bull_s >= bear_s and bull_s >= LOG_SCORE_THRESHOLD:
             direction = "BULL"
@@ -4707,6 +4855,17 @@ def _bt_simulate_ticker(ticker: str, df_full: pd.DataFrame) -> list:
             cq        = res.get("bear_cq", "WEAK")
             sl        = res.get("bear_stop")
             tp_price  = res.get("bear_tp")
+        elif _is_reversal:
+            # Reversal-only trade: BEAR with swing-high SL + VWAP-midpoint TP
+            direction = "BEAR"
+            score     = _rev_score * 10  # scale 0-60 for display
+            cq        = "REV"
+            _atr_bt   = res.get("atr") or 1
+            _sh_bt    = res.get("session_high") or 0
+            _vwap_bt  = res.get("vwap_val")
+            _price_bt = res.get("price", 0) or 1
+            sl        = (_sh_bt + 0.25 * _atr_bt) if _sh_bt else None
+            tp_price  = ((_price_bt + _vwap_bt) / 2) if _vwap_bt else None
         else:
             continue
 
