@@ -36,7 +36,7 @@ WATCHLIST             = ["SPY", "QQQ", "IWM", "NVDA", "AAPL"]
 SIGNAL_LOG_FILE       = "/tmp/signal_log.json"
 CSV_LOG_FILE          = "/tmp/signals.csv"
 HISTORY_FILE_TMPL     = "/tmp/score_history_{}.json"
-MAX_SCORE             = 29       # 20 + 5 institutional + 2 pivot + 2 candlestick/regime signals per direction
+MAX_SCORE             = 31       # 20 + 5 institutional + 2 pivot + 2 candlestick/regime + 2 fib signals per direction
 ALERT_COOLDOWN_SECS   = 900
 VOLUME_SPIKE_MULT     = 3.0
 ALERT_SCORE_THRESHOLD = 9
@@ -70,6 +70,12 @@ VOL_DELTA_LOOKBACK    = 5       # bars to compute cumulative volume delta over
 # Optional paid-API upgrade paths (set env vars to enable)
 POLYGON_TIER          = os.getenv("POLYGON_TIER",        "free")  # "paid" → v3/trades
 UNUSUAL_WHALES_KEY    = os.getenv("UNUSUAL_WHALES_KEY",  "")      # enables UW sweeps API
+
+# ── Phase 11: Fibonacci config ───────────────────────────────────────────────
+FIB_LOOKBACK          = 200      # 1m bars to scan for swing high/low (~3-4 RTH hours)
+FIB_ZONE_ATR          = 0.5     # price within 0.5×ATR of fib level = "at zone"
+RS_LEADER_THRESH      = 0.15    # ticker outperforming SPY by ≥0.15% = RS leader
+RS_LAGGER_THRESH      = -0.15   # ticker underperforming SPY by ≥0.15% = RS lagger
 
 print("=== SPX CONFLUENCE SCANNER STARTING ===", flush=True)
 
@@ -341,6 +347,58 @@ def _compute_max_pain(calls, puts):
         return float(best)
     except Exception:
         return None
+
+
+# ====================== FIBONACCI & RELATIVE STRENGTH (Phase 11) ==========
+
+def compute_fib_levels(df_1m, lookback=None):
+    """
+    Find the swing high and swing low over the last `lookback` 1m bars and
+    compute classic Fibonacci retracement levels between them.
+
+    The swing range captures roughly 3-4 hours of RTH price action (FIB_LOOKBACK=200).
+    Fib levels are measured from the swing high downward — so fib_618 is 61.8%
+    of the way from swing_high down to swing_low (the "golden ratio" support zone).
+    These levels act as dynamic support when price pulls back in an uptrend
+    and as dynamic resistance when price bounces in a downtrend.
+    """
+    if df_1m is None or len(df_1m) < 20:
+        return {}
+    n = lookback if lookback is not None else FIB_LOOKBACK
+    recent = df_1m.tail(min(n, len(df_1m)))
+    h = float(recent['High'].max())
+    l = float(recent['Low'].min())
+    diff = h - l
+    if diff < 1e-9:
+        return {}
+    return {
+        'swing_high': round(h, 2),
+        'swing_low':  round(l, 2),
+        'fib_236':    round(h - 0.236 * diff, 2),
+        'fib_382':    round(h - 0.382 * diff, 2),
+        'fib_500':    round(h - 0.500 * diff, 2),
+        'fib_618':    round(h - 0.618 * diff, 2),
+        'fib_786':    round(h - 0.786 * diff, 2),
+    }
+
+
+def _fib_level_name(price, fib_data):
+    """Return the name of the nearest key fib level and its value."""
+    key_levels = {
+        '23.6%': fib_data.get('fib_236'),
+        '38.2%': fib_data.get('fib_382'),
+        '50.0%': fib_data.get('fib_500'),
+        '61.8%': fib_data.get('fib_618'),
+        '78.6%': fib_data.get('fib_786'),
+    }
+    best_name, best_val, best_dist = None, None, float('inf')
+    for name, val in key_levels.items():
+        if val is None:
+            continue
+        dist = abs(price - val)
+        if dist < best_dist:
+            best_dist, best_val, best_name = dist, val, name
+    return best_name, best_val, best_dist
 
 
 # ====================== CANDLESTICK & REGIME DETECTION (Phase 10) =========
@@ -981,6 +1039,11 @@ _blank_ticker = lambda t: {
     "candle_bull_pat": None,
     "candle_bear_pat": None,
     "regime":          "unknown",
+    # Phase 11
+    "fib_swing_high": None, "fib_swing_low": None,
+    "fib_236": None, "fib_382": None, "fib_500": None, "fib_618": None, "fib_786": None,
+    "fib_at_zone": False, "fib_zone_level": None, "fib_zone_val": None,
+    "rs_vs_spy": None, "rs_signal": None,
     "bull_signals": {},
     "bear_signals": {},
     "history":      load_history(t),
@@ -1458,6 +1521,31 @@ def compute_signals(df_1m, df_5m, ticker=None):
     regime_bear_ok = regime in ('trending_down', 'breakout_down')
     regime_label   = regime.replace('_', ' ').title() if regime else "Unknown"
 
+    # ── Phase 11: Fibonacci retracement ──────────────────────────────────────
+    fib_data   = compute_fib_levels(df_1m)
+    fib_zone   = FIB_ZONE_ATR * (atr_val or 0.5)
+    fib_lv_name, fib_lv_val, fib_lv_dist = _fib_level_name(price, fib_data)
+    fib_at_zone = fib_lv_val is not None and fib_lv_dist <= fib_zone
+    # Support: at zone AND price ≥ level (bouncing off support from above)
+    # Resist:  at zone AND price ≤ level (pressing against resistance from below)
+    fib_support_ok = fib_at_zone and price >= fib_lv_val
+    fib_resist_ok  = fib_at_zone and price <= fib_lv_val
+    if fib_at_zone and fib_lv_name and fib_lv_val:
+        fib_label = f"Fib {fib_lv_name} ${fib_lv_val:.2f}"
+    else:
+        nearest_above = min(
+            (v for v in fib_data.values() if isinstance(v, float) and v > price),
+            default=None
+        )
+        nearest_below = max(
+            (v for v in fib_data.values() if isinstance(v, float) and v < price),
+            default=None
+        )
+        if nearest_above and nearest_below:
+            fib_label = f"Btw ${nearest_below:.2f}–${nearest_above:.2f}"
+        else:
+            fib_label = "No zone"
+
     # ── Signal builder helper ──────────────────────────────────────────────────
     def bs(label, pts, active, value, tf1=None, tf5=None):
         d = {"label": label, "points": pts, "active": bool(active), "value": value}
@@ -1516,6 +1604,9 @@ def compute_signals(df_1m, df_5m, ticker=None):
         # ── Candle patterns + regime (Phase 10) ───────────────────────────────
         "candle_bull": bs("Candle Pattern ↑", 1, candle_bull_pat is not None, candle_bull_pat or "None"),
         "regime_bull": bs("Regime: Bull",     1, regime_bull_ok,          regime_label),
+        # ── Fibonacci zones (Phase 11) ─────────────────────────────────────────
+        "fib_support": bs("Fib Support",      1, fib_support_ok,          fib_label),
+        "fib_ext":     bs("Fib Extension ↑",  1, bool(fib_data.get('swing_high') and price > fib_data['swing_high']), f">{fib_data.get('swing_high','--')}"),
     }
     bull_score = sum(s['points'] for s in bull.values() if s['active'])
 
@@ -1568,6 +1659,9 @@ def compute_signals(df_1m, df_5m, ticker=None):
         # ── Candle patterns + regime (Phase 10) ───────────────────────────────
         "candle_bear": bs("Candle Pattern ↓", 1, candle_bear_pat is not None, candle_bear_pat or "None"),
         "regime_bear": bs("Regime: Bear",     1, regime_bear_ok,          regime_label),
+        # ── Fibonacci zones (Phase 11) ─────────────────────────────────────────
+        "fib_resist":  bs("Fib Resistance",   1, fib_resist_ok,           fib_label),
+        "fib_ext":     bs("Fib Extension ↓",  1, bool(fib_data.get('swing_low') and price < fib_data['swing_low']), f"<{fib_data.get('swing_low','--')}"),
     }
     bear_score = sum(s['points'] for s in bear.values() if s['active'])
 
@@ -1619,6 +1713,13 @@ def compute_signals(df_1m, df_5m, ticker=None):
         "candle_bull_pat": candle_bull_pat,
         "candle_bear_pat": candle_bear_pat,
         "regime":          regime,
+        # Phase 11
+        "fib_swing_high": fib_data.get('swing_high'),
+        "fib_swing_low":  fib_data.get('swing_low'),
+        "fib_236": fib_data.get('fib_236'), "fib_382": fib_data.get('fib_382'),
+        "fib_500": fib_data.get('fib_500'), "fib_618": fib_data.get('fib_618'),
+        "fib_786": fib_data.get('fib_786'),
+        "fib_at_zone": fib_at_zone, "fib_zone_level": fib_lv_name, "fib_zone_val": fib_lv_val,
     }
 
 
@@ -1770,6 +1871,28 @@ def update_market_breadth():
     })
     print(f"Breadth: {bull_count}B/{bear_count}b/{total} → {breadth}", flush=True)
 
+    # ── Phase 11: Relative Strength vs SPY ────────────────────────────────────
+    spy = dashboard_data.get("SPY", {})
+    spy_price = spy.get("price")
+    spy_prev  = spy.get("prev_close")
+    spy_chg   = ((spy_price - spy_prev) / spy_prev * 100) if spy_price and spy_prev and spy_prev > 0 else None
+    for ticker, d in dashboard_data.items():
+        if ticker == "SPY":
+            d["rs_vs_spy"] = 0.0
+            d["rs_signal"] = "benchmark"
+            continue
+        t_price = d.get("price")
+        t_prev  = d.get("prev_close")
+        if not t_price or not t_prev or t_prev <= 0 or spy_chg is None:
+            d["rs_vs_spy"] = None
+            d["rs_signal"] = None
+            continue
+        t_chg = (t_price - t_prev) / t_prev * 100
+        rs = round(t_chg - spy_chg, 2)
+        d["rs_vs_spy"]  = rs
+        d["rs_signal"]  = ("leader" if rs >= RS_LEADER_THRESH else
+                           "lagger" if rs <= RS_LAGGER_THRESH else "neutral")
+
 
 async def scan_ticker(client, ticker, market_open):
     print(f"Scanning {ticker}...", flush=True)
@@ -1880,6 +2003,13 @@ async def scan_ticker(client, ticker, market_open):
         "candle_bull_pat": result['candle_bull_pat'],
         "candle_bear_pat": result['candle_bear_pat'],
         "regime":          result['regime'],
+        # Phase 11
+        "fib_swing_high": result['fib_swing_high'], "fib_swing_low": result['fib_swing_low'],
+        "fib_236": result['fib_236'], "fib_382": result['fib_382'],
+        "fib_500": result['fib_500'], "fib_618": result['fib_618'], "fib_786": result['fib_786'],
+        "fib_at_zone":    result['fib_at_zone'],
+        "fib_zone_level": result['fib_zone_level'],
+        "fib_zone_val":   result['fib_zone_val'],
         # PCR from options_data (updated by fetch_options_flow, not per-scan)
         "pcr":          options_data.get(ticker, {}).get("pcr"),
         "pcr_oi":       options_data.get(ticker, {}).get("pcr_oi"),
@@ -2222,6 +2352,7 @@ let scoreChart   = null;
 const MAX_SCORE           = """ + str(MAX_SCORE) + """;
 const ALERT_SCORE_THRESH  = """ + str(ALERT_SCORE_THRESHOLD) + """;
 const LOG_SCORE_THRESH    = """ + str(LOG_SCORE_THRESHOLD) + """;
+const FIB_LOOKBACK        = """ + str(200) + """;
 
 const TV_SYMBOLS = {
   SPY:'AMEX:SPY', QQQ:'NASDAQ:QQQ', IWM:'AMEX:IWM',
@@ -2328,6 +2459,7 @@ function renderTickerRow() {
           ${d.trend_1h  ? `<span class="ms-1" style="color:${d.trend_1h==='bull'?'#00ff88':'#ff6666'}">1h ${d.trend_1h==='bull'?'▲':'▼'}</span>` : ''}
           ${d.tod_ok === false ? '<span class="ms-1" style="color:#ffaa00">⏸ TOD</span>' : ''}
           ${d.regime && d.regime !== 'unknown' ? `<span class="ms-1 regime-${d.regime}">${{trending_up:'↗Trend',trending_down:'↘Trend',breakout_up:'⚡BO↑',breakout_down:'⚡BO↓',ranging:'↔Range',neutral:'~'}[d.regime]||d.regime}</span>` : ''}
+          ${d.rs_signal && d.rs_signal !== 'benchmark' && d.rs_signal !== 'neutral' ? `<span class="ms-1" style="color:${d.rs_signal==='leader'?'#00ffcc':'#ff9966'};font-size:.62rem">${d.rs_signal==='leader'?'RS+':'RS−'} ${d.rs_vs_spy!=null?(d.rs_vs_spy>0?'+':'')+d.rs_vs_spy.toFixed(1)+'%':''}</span>` : ''}
         </div>
         <div class="bar-wrap mt-1">
           <div class="bar" style="width:${Math.min(score/MAX_SCORE*100,100)}%;background:${scoreColor(score)}"></div>
@@ -2494,6 +2626,18 @@ function renderContextRow() {
   if (d.tape_signal) {
     const tapeLabel = d.tape_signal.replace(/_/g,' ').replace(/\\b\\w/g,c=>c.toUpperCase());
     html += `<span class="ctx-badge" style="${instStyle}" title="Tape reading signal"># ${tapeLabel}</span>`;
+  }
+
+  // Phase 11: Fibonacci zone + RS badges
+  if (d.fib_at_zone && d.fib_zone_level && d.fib_zone_val != null) {
+    const aboveFib = d.price >= d.fib_zone_val;
+    const fibCls   = aboveFib ? 'ctx-bull' : 'ctx-bear';
+    html += `<span class="ctx-badge ${fibCls}" title="Price is at Fibonacci zone — potential ${aboveFib?'support':'resistance'}">Fib ${d.fib_zone_level} $${d.fib_zone_val.toFixed(2)} ${aboveFib?'▲':'▼'}</span>`;
+  }
+  if (d.rs_vs_spy != null && d.rs_signal && d.rs_signal !== 'benchmark') {
+    const rsCls   = d.rs_signal === 'leader' ? 'ctx-bull' : d.rs_signal === 'lagger' ? 'ctx-bear' : 'ctx-neutral';
+    const rsSign  = d.rs_vs_spy > 0 ? '+' : '';
+    html += `<span class="ctx-badge ${rsCls}" title="Session performance vs SPY">RS ${rsSign}${d.rs_vs_spy.toFixed(2)}% vs SPY</span>`;
   }
 
   row.innerHTML = html;
@@ -2815,7 +2959,7 @@ function renderAnalytics() {
 <div style="border-bottom:1px solid #1a1a1a;padding-bottom:10px;margin-bottom:10px">
   <div class="section-title">Key Levels — ${curTicker}</div>
   <div class="row g-2">
-    <div class="col-6">
+    <div class="col-12 col-md-4">
       <div style="font-size:.7rem;color:#555;text-transform:uppercase;letter-spacing:.5px;margin-bottom:4px">Pivot Points</div>
       <table style="width:100%;border-collapse:collapse;font-size:.75rem">
         ${lvlRow('R3', kd.pivot_r3, '#00ff88', false)}
@@ -2827,8 +2971,20 @@ function renderAnalytics() {
         ${lvlRow('S3', kd.pivot_s3, '#ff4444', false)}
       </table>
     </div>
-    <div class="col-6">
-      <div style="font-size:.7rem;color:#555;text-transform:uppercase;letter-spacing:.5px;margin-bottom:4px">Reference Levels</div>
+    <div class="col-12 col-md-4">
+      <div style="font-size:.7rem;color:#555;text-transform:uppercase;letter-spacing:.5px;margin-bottom:4px">Fibonacci (${FIB_LOOKBACK}m swing)</div>
+      <table style="width:100%;border-collapse:collapse;font-size:.75rem">
+        ${lvlRow('Swing Hi', kd.fib_swing_high, '#aaffaa', kd.fib_at_zone && kd.price >= kd.fib_zone_val)}
+        ${lvlRow('23.6%',    kd.fib_236,        '#66cc88', kd.fib_zone_level==='23.6%')}
+        ${lvlRow('38.2%',    kd.fib_382,        '#44bb77', kd.fib_zone_level==='38.2%')}
+        ${lvlRow('50.0%',    kd.fib_500,        '#ffcc44', kd.fib_zone_level==='50.0%')}
+        ${lvlRow('61.8% ✦', kd.fib_618,        '#ff9944', kd.fib_zone_level==='61.8%')}
+        ${lvlRow('78.6%',    kd.fib_786,        '#ff6644', kd.fib_zone_level==='78.6%')}
+        ${lvlRow('Swing Lo', kd.fib_swing_low,  '#ffaaaa', kd.fib_at_zone && kd.price <= kd.fib_zone_val)}
+      </table>
+    </div>
+    <div class="col-12 col-md-4">
+      <div style="font-size:.7rem;color:#555;text-transform:uppercase;letter-spacing:.5px;margin-bottom:4px">Reference</div>
       <table style="width:100%;border-collapse:collapse;font-size:.75rem">
         ${lvlRow('Prev High',  kd.prev_high,  '#aaa', false)}
         ${lvlRow('Prev Close', kd.prev_close, '#666', false)}
@@ -2843,6 +2999,7 @@ function renderAnalytics() {
         ${kd.regime && kd.regime !== 'unknown' ? `<tr><td style="color:#555;padding:2px 6px">Regime</td><td style="text-align:right;padding:2px 6px;color:#aaa">${kd.regime.replace(/_/g,' ')}</td></tr>` : ''}
         ${kd.candle_bull_pat ? `<tr><td style="color:#555;padding:2px 6px">Bull Pat</td><td style="text-align:right;padding:2px 6px;color:#00ff88">${kd.candle_bull_pat}</td></tr>` : ''}
         ${kd.candle_bear_pat ? `<tr><td style="color:#555;padding:2px 6px">Bear Pat</td><td style="text-align:right;padding:2px 6px;color:#ff6666">${kd.candle_bear_pat}</td></tr>` : ''}
+        ${kd.rs_vs_spy != null && kd.rs_signal !== 'benchmark' ? `<tr><td style="color:#555;padding:2px 6px">RS vs SPY</td><td style="text-align:right;padding:2px 6px;color:${kd.rs_signal==='leader'?'#00ffcc':kd.rs_signal==='lagger'?'#ff9966':'#777'}">${kd.rs_vs_spy>0?'+':''}${kd.rs_vs_spy.toFixed(2)}%</td></tr>` : ''}
       </table>
     </div>
   </div>
