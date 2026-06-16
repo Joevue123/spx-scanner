@@ -21,7 +21,9 @@ from flask import Flask, jsonify
 from polygon import RESTClient
 from waitress import serve as _waitress_serve
 from alpaca.trading.client import TradingClient
-from alpaca.trading.requests import MarketOrderRequest, TakeProfitRequest, StopLossRequest
+from alpaca.trading.requests import (
+    MarketOrderRequest, TakeProfitRequest, StopLossRequest, GetOrdersRequest
+)
 from alpaca.trading.enums import OrderSide, TimeInForce, OrderClass
 
 # ====================== CONFIG ======================
@@ -1184,6 +1186,52 @@ def _get_alpaca() -> TradingClient | None:
     return _alpaca_client
 
 
+def _alpaca_has_conflict(client, ticker, direction):
+    """
+    Returns True if Alpaca already has an open position or pending order
+    on this ticker in the same direction. Prevents double-entry on restart
+    or rapid re-trigger — this is the Alpaca-side guard; the in-memory
+    open_trades dict is the fast path that runs first.
+    """
+    want_long = direction == "BULL"
+
+    # 1. Check open positions
+    try:
+        pos = client.get_open_position(ticker)
+        # pos exists — check direction
+        already_long = pos.side.value == "long"
+        if already_long == want_long:
+            print(f"[ALPACA] Conflict: {ticker} already has {'long' if already_long else 'short'} position", flush=True)
+            return True
+    except Exception:
+        pass  # no position — ok
+
+    # 2. Check pending/open orders on this symbol
+    try:
+        pending = client.get_orders(GetOrdersRequest(symbols=[ticker]))
+        if pending:
+            print(f"[ALPACA] Conflict: {ticker} has {len(pending)} open order(s)", flush=True)
+            return True
+    except Exception:
+        pass
+
+    return False
+
+
+def _score_scaled_qty(price, score):
+    """
+    Scale position size by conviction score:
+      score at alert floor (22%) → 0.72× base USD
+      score at 50%             → 1.00× base USD
+      score at 80%+            → 1.30× base USD
+      cap at 1.5× (score=100%)
+    Returns integer share count, minimum 1.
+    """
+    score_ratio  = min(score / MAX_SCORE, 1.0)
+    effective_usd = TRADE_SIZE_USD * (0.5 + score_ratio)
+    return max(1, int(effective_usd / price))
+
+
 def submit_alpaca_order(ticker, direction, price, stop, tp, score, cq):
     """Submit a bracket order to Alpaca (market entry + OCA stop/TP)."""
     if not ALPACA_ENABLED:
@@ -1196,8 +1244,12 @@ def submit_alpaca_order(ticker, direction, price, stop, tp, score, cq):
     if not client:
         return None
 
+    # Alpaca-side double-entry guardrail (survives process restarts)
+    if _alpaca_has_conflict(client, ticker, direction):
+        return None
+
     try:
-        shares = max(1, int(TRADE_SIZE_USD / price))
+        shares = _score_scaled_qty(price, score)
         side   = OrderSide.BUY if direction == "BULL" else OrderSide.SELL
 
         req = MarketOrderRequest(
@@ -1210,10 +1262,12 @@ def submit_alpaca_order(ticker, direction, price, stop, tp, score, cq):
             stop_loss=StopLossRequest(stop_price=round(stop, 2)),
         )
         order = client.submit_order(req)
+        effective_usd = shares * price
         env = "PAPER" if ALPACA_PAPER else "LIVE"
         print(
-            f"[ALPACA:{env}] ORDER {order.id} | {ticker} {direction} {shares}sh "
-            f"@ mkt | SL${stop:.2f} TP${tp:.2f} | score={score} CQ={cq}",
+            f"[ALPACA:{env}] ORDER {order.id} | {ticker} {direction} "
+            f"{shares}sh (~${effective_usd:.0f}) | SL${stop:.2f} TP${tp:.2f} "
+            f"| score={score}/{MAX_SCORE} ({score/MAX_SCORE*100:.0f}%) CQ={cq}",
             flush=True
         )
         return str(order.id)
@@ -4193,73 +4247,102 @@ function renderAnalytics() {
       <span style="color:#333;font-size:.78rem">Not configured — add ALPACA_API_KEY + ALPACA_SECRET_KEY to .env</span>
     </div>`;
   } else {
-    const env   = alpacaData.paper ? `<span style="color:#ffaa00;font-size:.62rem;border:1px solid #ffaa0044;padding:1px 5px;border-radius:2px">PAPER</span>`
-                                   : `<span style="color:#ff4444;font-size:.62rem;font-weight:bold;border:1px solid #ff444455;padding:1px 5px;border-radius:2px">LIVE</span>`;
-    const acct  = alpacaData.account || {};
-    const pos   = alpacaData.positions || [];
-    const ords  = alpacaData.orders   || [];
-    const err   = alpacaData.error;
+    const isLive = !alpacaData.paper;
+    const envBadge = isLive
+      ? `<span style="background:#ff444422;color:#ff6666;font-size:.6rem;font-weight:700;border:1px solid #ff444455;padding:2px 7px;border-radius:3px;letter-spacing:.5px">LIVE</span>`
+      : `<span style="background:#ffaa0011;color:#ffaa00;font-size:.6rem;font-weight:600;border:1px solid #ffaa0033;padding:2px 7px;border-radius:3px;letter-spacing:.5px">PAPER</span>`;
+    const acct = alpacaData.account || {};
+    const pos  = alpacaData.positions || [];
+    const ords = alpacaData.orders    || [];
+    const err  = alpacaData.error;
 
-    const acctRow = (label, val, color) =>
-      val != null ? `<span style="font-size:.72rem;color:#555">${label}:</span> <span style="font-size:.72rem;color:${color||'#aaa'};margin-right:12px">${val}</span>` : '';
+    const fmt$ = n => n != null ? '$' + parseFloat(n).toLocaleString('en-US',{minimumFractionDigits:2,maximumFractionDigits:2}) : '–';
+    const fmt$k = n => n != null ? '$' + (parseFloat(n)/1000).toFixed(1)+'k' : '–';
 
-    const acctHtml = acct.equity != null ? `
-      <div class="d-flex flex-wrap align-items-center gap-1 mb-2" style="margin-top:4px">
-        ${acctRow('Equity',   '$' + acct.equity.toLocaleString('en-US',{maximumFractionDigits:2}), '#fff')}
-        ${acctRow('BP',       '$' + acct.buying_power.toLocaleString('en-US',{maximumFractionDigits:0}), '#00ffcc')}
-        ${acctRow('Cash',     '$' + acct.cash.toLocaleString('en-US',{maximumFractionDigits:0}), '#aaa')}
-        ${acctRow('DT count', acct.daytrade_count, acct.daytrade_count >= 3 ? '#ff6666' : '#ffaa00')}
-        ${acctRow('Size/trade', '$' + (alpacaData.size_usd||0), '#777')}
-        ${acctRow('CQ min', alpacaData.cq_min, '#777')}
-      </div>` : (err ? `<div style="color:#ff6666;font-size:.76rem;margin:4px 0">${err}</div>` : '');
+    const dtClr = acct.daytrade_count >= 3 ? '#ff6666' : acct.daytrade_count >= 2 ? '#ffaa00' : '#555';
+
+    const statusRow = acct.equity != null ? `
+    <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(110px,1fr));gap:6px;margin:8px 0 10px">
+      <div style="background:#0d0d0d;border:1px solid #1a1a1a;border-radius:4px;padding:6px 10px">
+        <div style="font-size:.58rem;color:#444;text-transform:uppercase;letter-spacing:.5px;margin-bottom:2px">Portfolio Value</div>
+        <div style="font-size:.95rem;color:#fff;font-weight:700">${fmt$(acct.portfolio_value)}</div>
+      </div>
+      <div style="background:#0d0d0d;border:1px solid #1a1a1a;border-radius:4px;padding:6px 10px">
+        <div style="font-size:.58rem;color:#444;text-transform:uppercase;letter-spacing:.5px;margin-bottom:2px">Buying Power</div>
+        <div style="font-size:.95rem;color:#00ffcc;font-weight:700">${fmt$(acct.buying_power)}</div>
+      </div>
+      <div style="background:#0d0d0d;border:1px solid #1a1a1a;border-radius:4px;padding:6px 10px">
+        <div style="font-size:.58rem;color:#444;text-transform:uppercase;letter-spacing:.5px;margin-bottom:2px">Cash</div>
+        <div style="font-size:.95rem;color:#aaa;font-weight:600">${fmt$(acct.cash)}</div>
+      </div>
+      <div style="background:#0d0d0d;border:1px solid #1a1a1a;border-radius:4px;padding:6px 10px">
+        <div style="font-size:.58rem;color:#444;text-transform:uppercase;letter-spacing:.5px;margin-bottom:2px">Day Trades</div>
+        <div style="font-size:.95rem;font-weight:700;color:${dtClr}">${acct.daytrade_count} <span style="font-size:.65rem;color:#333">/ 3 PDT</span></div>
+      </div>
+    </div>
+    <div class="d-flex flex-wrap gap-3 mb-2" style="font-size:.7rem">
+      <span style="color:#555">Size/trade: <span style="color:#aaa">~$${alpacaData.size_usd||0} × score%</span></span>
+      <span style="color:#555">CQ gate: <span style="color:#aaa">${alpacaData.cq_min||'MED'}+</span></span>
+      <span style="color:#555">Exit: <span style="color:#aaa">OCA bracket (ATR ×""" + str(ATR_STOP_MULT) + """ SL / ×""" + str(ATR_TP_MULT) + """ TP)</span></span>
+    </div>` : (err ? `<div style="color:#ff6666;font-size:.76rem;margin:8px 0;padding:6px 10px;background:#ff000011;border-radius:4px">⚠ ${err}</div>` : '');
 
     const posHtml = pos.length ? `
-      <div style="font-size:.68rem;color:#555;text-transform:uppercase;letter-spacing:.5px;margin-bottom:3px">Open Positions (${pos.length})</div>
-      ${pos.map(p => {
-        const side  = p.side === 'long' ? {c:'#00ff88', lbl:'LONG'}  : {c:'#ff6666', lbl:'SHORT'};
-        const plClr = p.unrealized_pl == null ? '#555' : p.unrealized_pl >= 0 ? '#00ff88' : '#ff6666';
-        const plPct = p.unrealized_plpc != null ? ` (${(p.unrealized_plpc*100).toFixed(2)}%)` : '';
-        const plStr = p.unrealized_pl  != null ? `${p.unrealized_pl>=0?'+':''}$${p.unrealized_pl.toFixed(2)}${plPct}` : '–';
-        return `<div style="font-size:.73rem;padding:3px 0;border-bottom:1px solid #0d0d0d;display:flex;gap:8px;flex-wrap:wrap">
-          <span style="color:${side.c};font-weight:700;min-width:44px">${side.lbl}</span>
-          <span style="font-weight:600;min-width:40px">${p.symbol}</span>
-          <span style="color:#555">${p.qty}sh</span>
-          <span style="color:#666">@ $${parseFloat(p.avg_entry).toFixed(2)}</span>
-          ${p.current_price ? `<span style="color:#aaa">now $${parseFloat(p.current_price).toFixed(2)}</span>` : ''}
-          <span style="color:${plClr};font-weight:600;margin-left:auto">${plStr}</span>
-        </div>`;
-      }).join('')}` : `<div style="color:#333;font-size:.76rem;margin-bottom:4px">No open positions</div>`;
+    <div style="font-size:.68rem;color:#555;text-transform:uppercase;letter-spacing:.5px;margin-bottom:4px">Open Positions (${pos.length})</div>
+    <div style="border:1px solid #1a1a1a;border-radius:4px;overflow:hidden;margin-bottom:8px">
+    ${pos.map((p,i) => {
+      const isLong = p.side === 'long';
+      const sideClr = isLong ? '#00ff88' : '#ff6666';
+      const plClr   = p.unrealized_pl == null ? '#555' : p.unrealized_pl >= 0 ? '#00ff88' : '#ff6666';
+      const plPct   = p.unrealized_plpc != null ? ` (${(p.unrealized_plpc*100).toFixed(2)}%)` : '';
+      const plStr   = p.unrealized_pl  != null
+        ? `${p.unrealized_pl>=0?'+':''}${fmt$(p.unrealized_pl)}${plPct}` : '–';
+      return `<div style="display:flex;align-items:center;gap:8px;padding:5px 10px;${i>0?'border-top:1px solid #111':''}">
+        <span style="color:${sideClr};font-weight:700;min-width:42px;font-size:.72rem">${isLong?'LONG':'SHORT'}</span>
+        <span style="font-weight:700;min-width:40px">${p.symbol}</span>
+        <span style="color:#555;font-size:.7rem">${p.qty}sh</span>
+        <span style="color:#444;font-size:.7rem">@ ${fmt$(p.avg_entry)}</span>
+        ${p.current_price ? `<span style="color:#666;font-size:.7rem">→ ${fmt$(p.current_price)}</span>` : ''}
+        <span style="color:${plClr};font-weight:700;margin-left:auto;font-size:.76rem">${plStr}</span>
+      </div>`;
+    }).join('')}
+    </div>` : `<div style="color:#2a2a2a;font-size:.74rem;margin-bottom:6px;padding:5px 0">No open positions</div>`;
 
-    const ordStatusClr = s => ({filled:'#00ff88', partially_filled:'#aaff00', new:'#ffaa00', pending_new:'#ffaa00', accepted:'#ffaa00', canceled:'#555', expired:'#333'}[s] || '#777');
+    const ordStatusClr = s => ({filled:'#00ff88',partially_filled:'#aaff00',new:'#ffaa00',pending_new:'#ffaa00',accepted:'#ffaa00',held:'#ffaa00',canceled:'#333',expired:'#222',rejected:'#ff4444'})[s] || '#555';
     const ordHtml = ords.length ? `
-      <div style="font-size:.68rem;color:#555;text-transform:uppercase;letter-spacing:.5px;margin:6px 0 3px">Recent Orders</div>
-      <table style="width:100%;border-collapse:collapse">
-        <thead><tr style="color:#333;font-size:.58rem;text-transform:uppercase">
-          <th style="padding:1px 6px;text-align:left">Symbol</th>
-          <th style="padding:1px 4px">Side</th>
-          <th style="padding:1px 4px;text-align:right">Qty</th>
-          <th style="padding:1px 4px">Status</th>
-          <th style="padding:1px 6px;text-align:right">Fill $</th>
-          <th style="padding:1px 4px">Class</th>
-        </tr></thead>
-        <tbody>${ords.map(o => {
-          const sc = o.side === 'buy' ? '#00ff88' : '#ff6666';
-          const stc = ordStatusClr(o.status);
-          const fill = o.filled_avg_price ? '$' + parseFloat(o.filled_avg_price).toFixed(2) : '–';
-          return `<tr style="border-bottom:1px solid #0a0a0a;font-size:.7rem">
-            <td style="padding:2px 6px;font-weight:600">${o.symbol}</td>
-            <td style="padding:2px 4px;color:${sc};text-align:center">${o.side.toUpperCase()}</td>
-            <td style="padding:2px 4px;color:#666;text-align:right">${o.qty||'–'}</td>
-            <td style="padding:2px 4px;color:${stc}">${o.status}${o.legs>0?` [${o.legs}L]`:''}</td>
-            <td style="padding:2px 6px;color:#777;text-align:right">${fill}</td>
-            <td style="padding:2px 4px;color:#444;font-size:.62rem">${o.order_class||'simple'}</td>
-          </tr>`;
-        }).join('')}</tbody>
-      </table>` : `<div style="color:#333;font-size:.76rem">No recent orders</div>`;
+    <div style="font-size:.68rem;color:#555;text-transform:uppercase;letter-spacing:.5px;margin-bottom:4px">Recent Orders (${ords.length})</div>
+    <table style="width:100%;border-collapse:collapse;border:1px solid #1a1a1a;border-radius:4px;overflow:hidden">
+      <thead><tr style="background:#0a0a0a;color:#333;font-size:.58rem;text-transform:uppercase">
+        <th style="padding:3px 8px;text-align:left">Symbol</th>
+        <th style="padding:3px 6px;text-align:left">Side</th>
+        <th style="padding:3px 6px;text-align:right">Qty</th>
+        <th style="padding:3px 6px">Status</th>
+        <th style="padding:3px 8px;text-align:right">Fill</th>
+        <th style="padding:3px 6px;text-align:center">Type</th>
+      </tr></thead>
+      <tbody>${ords.map((o,i) => {
+        const sc   = o.side === 'buy' ? '#00ff88' : '#ff6666';
+        const stc  = ordStatusClr(o.status);
+        const fill = o.filled_avg_price ? fmt$(o.filled_avg_price) : '–';
+        const cls  = o.order_class === 'bracket' ? `<span style="color:#00ffcc;font-size:.58rem">BRACKET ${o.legs>0?`[${o.legs}L]`:''}</span>`
+                   : `<span style="color:#444;font-size:.58rem">${o.order_class||'simple'}</span>`;
+        return `<tr style="border-top:1px solid #111;font-size:.7rem">
+          <td style="padding:3px 8px;font-weight:700">${o.symbol}</td>
+          <td style="padding:3px 6px;color:${sc};font-weight:600">${o.side.toUpperCase()}</td>
+          <td style="padding:3px 6px;color:#666;text-align:right">${o.qty||'–'}</td>
+          <td style="padding:3px 6px;color:${stc}">${o.status}</td>
+          <td style="padding:3px 8px;color:#777;text-align:right">${fill}</td>
+          <td style="padding:3px 6px;text-align:center">${cls}</td>
+        </tr>`;
+      }).join('')}</tbody>
+    </table>` : `<div style="color:#2a2a2a;font-size:.74rem;padding:5px 0">No recent orders</div>`;
 
+    const connDot = `<span style="display:inline-block;width:7px;height:7px;border-radius:50%;background:${acct.equity!=null?'#00ff88':'#ff6666'};margin-right:5px;box-shadow:0 0 6px ${acct.equity!=null?'#00ff88':'#ff6666'}"></span>`;
     alpacaHtml = `<div style="border-bottom:1px solid #1a1a1a;padding-bottom:10px;margin-bottom:10px">
-      <div class="section-title d-flex align-items-center gap-2">Alpaca Execution ${env}</div>
-      ${acctHtml}${posHtml}${ordHtml}
+      <div class="section-title d-flex align-items-center gap-2">
+        ${connDot}Alpaca Execution ${envBadge}
+        ${acct.equity!=null ? `<span style="font-size:.62rem;color:#00ff88;margin-left:4px">CONNECTED</span>` : `<span style="font-size:.62rem;color:#ff6666">DISCONNECTED</span>`}
+      </div>
+      ${statusRow}${posHtml}${ordHtml}
     </div>`;
   }
 
