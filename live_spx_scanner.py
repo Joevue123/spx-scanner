@@ -36,7 +36,7 @@ WATCHLIST             = ["SPY", "QQQ", "IWM", "NVDA", "AAPL"]
 SIGNAL_LOG_FILE       = "/tmp/signal_log.json"
 CSV_LOG_FILE          = "/tmp/signals.csv"
 HISTORY_FILE_TMPL     = "/tmp/score_history_{}.json"
-MAX_SCORE             = 25       # 20 + 5 institutional flow signals per direction
+MAX_SCORE             = 27       # 20 + 5 institutional + 2 pivot/key-level signals per direction
 ALERT_COOLDOWN_SECS   = 900
 VOLUME_SPIKE_MULT     = 3.0
 ALERT_SCORE_THRESHOLD = 9
@@ -283,6 +283,64 @@ def send_daily_summary():
         subject=f"[SPX Scanner] Daily Summary {date.today().isoformat()}",
         body=summary,
     )
+
+
+# ====================== KEY LEVELS (Phase 9) ==============================
+
+def compute_pivot_levels(df_1m):
+    """
+    Classic daily pivot points computed from the previous RTH trading day's OHLC.
+    PP = (H+L+C)/3 — the central gravity point for the session.
+    R/S levels give the first three resistance/support targets above/below PP.
+    Also returns prev-day high/low/close as key breakout reference levels.
+    """
+    if df_1m is None or len(df_1m) < 2:
+        return {}
+    ts_et = pd.to_datetime(df_1m['ts'], unit='ms', utc=True).dt.tz_convert(_ET)
+    dates = sorted(set(ts_et.dt.date))
+    if len(dates) < 2:
+        return {}
+    prev_date = dates[-2]
+    prev = df_1m[ts_et.dt.date == prev_date]
+    if len(prev) == 0:
+        return {}
+    H = float(prev['High'].max())
+    L = float(prev['Low'].min())
+    C = float(prev['Close'].iloc[-1])
+    PP = (H + L + C) / 3
+    R1 = 2*PP - L;  R2 = PP + (H - L);  R3 = H + 2*(PP - L)
+    S1 = 2*PP - H;  S2 = PP - (H - L);  S3 = L - 2*(H - PP)
+    return {
+        'pivot_pp':   round(PP, 2),
+        'pivot_r1':   round(R1, 2), 'pivot_r2': round(R2, 2), 'pivot_r3': round(R3, 2),
+        'pivot_s1':   round(S1, 2), 'pivot_s2': round(S2, 2), 'pivot_s3': round(S3, 2),
+        'prev_high':  round(H,  2),
+        'prev_low':   round(L,  2),
+        'prev_close': round(C,  2),
+    }
+
+
+def _compute_max_pain(calls, puts):
+    """
+    Options max pain: the price at which total dollar value of expiring options is minimised,
+    meaning option sellers (dealers) have minimum payout obligation — price gravitates here
+    on expiry day.  O(n²) over strikes but chains are small (~50-150 rows).
+    """
+    try:
+        c_oi = dict(zip(calls['strike'], calls['openInterest'].fillna(0)))
+        p_oi = dict(zip(puts['strike'],  puts['openInterest'].fillna(0)))
+        strikes = sorted(set(c_oi) | set(p_oi))
+        if not strikes:
+            return None
+        best, min_p = strikes[0], float('inf')
+        for px in strikes:
+            pain = sum(max(px - k, 0) * c_oi.get(k, 0) for k in strikes)
+            pain += sum(max(k - px, 0) * p_oi.get(k, 0) for k in strikes)
+            if pain < min_p:
+                min_p, best = pain, px
+        return float(best)
+    except Exception:
+        return None
 
 
 # ====================== INSTITUTIONAL FLOW DETECTION (Phase 8) ========
@@ -781,6 +839,11 @@ _blank_ticker = lambda t: {
     "vwap_strength":   None,
     "tape_signal":     None,
     "tape_mult":       None,
+    # Phase 9: pivot levels + max pain
+    "pivot_pp":    None, "pivot_r1": None, "pivot_r2": None, "pivot_r3": None,
+    "pivot_s1":    None, "pivot_s2": None, "pivot_s3": None,
+    "prev_high":   None, "prev_low": None, "prev_close": None,
+    "max_pain":    None,
     "bull_signals": {},
     "bear_signals": {},
     "history":      load_history(t),
@@ -1227,6 +1290,29 @@ def compute_signals(df_1m, df_5m, ticker=None):
     tape_bear = tape_signal in ('aggressive_sell', 'iceberg_bear')
     tape_label = (tape_signal.replace('_', ' ').title() + f" ×{tape_mult}" if tape_signal else "No signal")
 
+    # ── Phase 9: Pivot levels + key levels ────────────────────────────────────
+    pivots    = compute_pivot_levels(df_1m)
+    pp        = pivots.get('pivot_pp')
+    r1        = pivots.get('pivot_r1')
+    r2        = pivots.get('pivot_r2')
+    r3        = pivots.get('pivot_r3')
+    s1        = pivots.get('pivot_s1')
+    s2        = pivots.get('pivot_s2')
+    s3        = pivots.get('pivot_s3')
+    prev_high  = pivots.get('prev_high')
+    prev_low   = pivots.get('prev_low')
+    prev_close = pivots.get('prev_close')
+    max_pain   = opts_info.get('max_pain')   # stored by fetch_options_flow, no extra API call
+
+    pivot_bull_ok = bool(pp       and price > pp)
+    pdh_break_ok  = bool(prev_high and price > prev_high)
+    pivot_bear_ok = bool(pp       and price < pp)
+    pdl_break_ok  = bool(prev_low  and price < prev_low)
+
+    pp_str   = f"${pp:.2f}"        if pp        else "No data"
+    pdh_str  = f"${prev_high:.2f}" if prev_high else "No data"
+    pdl_str  = f"${prev_low:.2f}"  if prev_low  else "No data"
+
     # ── Signal builder helper ──────────────────────────────────────────────────
     def bs(label, pts, active, value, tf1=None, tf5=None):
         d = {"label": label, "points": pts, "active": bool(active), "value": value}
@@ -1279,6 +1365,9 @@ def compute_signals(df_1m, df_5m, ticker=None):
         "vol_delta":   bs("Vol Delta ▲",      1, delta_bull,              delta_label),
         "vwap_def":    bs("VWAP Bounce",      1, vwap_event == 'bounce',  vwap_def_label),
         "tape_read":   bs("Tape Aggression ↑",1, tape_bull,               tape_label),
+        # ── Pivot / key levels (Phase 9) ──────────────────────────────────────
+        "pivot_bull":  bs("Above Pivot PP",   1, pivot_bull_ok,           pp_str),
+        "pdh_break":   bs("PDH Breakout",     1, pdh_break_ok,            pdh_str),
     }
     bull_score = sum(s['points'] for s in bull.values() if s['active'])
 
@@ -1325,6 +1414,9 @@ def compute_signals(df_1m, df_5m, ticker=None):
         "vol_delta":   bs("Vol Delta ▼",      1, delta_bear,              delta_label),
         "vwap_def":    bs("VWAP Rejection",   1, vwap_event == 'rejection',vwap_def_label),
         "tape_read":   bs("Tape Aggression ↓",1, tape_bear,               tape_label),
+        # ── Pivot / key levels (Phase 9) ──────────────────────────────────────
+        "pivot_bear":  bs("Below Pivot PP",   1, pivot_bear_ok,           pp_str),
+        "pdl_break":   bs("PDL Breakdown",    1, pdl_break_ok,            pdl_str),
     }
     bear_score = sum(s['points'] for s in bear.values() if s['active'])
 
@@ -1368,6 +1460,10 @@ def compute_signals(df_1m, df_5m, ticker=None):
         "tape_signal":      tape_signal,
         "tape_mult":        tape_mult,
         "net_flow":         net_flow,
+        # Phase 9: pivot levels + key levels
+        "pivot_pp":   pp,    "pivot_r1": r1,   "pivot_r2": r2,   "pivot_r3": r3,
+        "pivot_s1":   s1,    "pivot_s2": s2,   "pivot_s3": s3,
+        "prev_high":  prev_high,  "prev_low": prev_low,  "prev_close": prev_close,
     }
 
 
@@ -1453,6 +1549,8 @@ def fetch_options_flow(ticker_sym):
             net_flow = uw["net_sweep"]
             unusual_calls = net_flow == "calls"
             unusual_puts  = net_flow == "puts"
+        # Phase 9: max pain from same chain (no extra API call)
+        max_pain = _compute_max_pain(calls, puts)
         options_data[ticker_sym] = {
             "pcr":          pcr_vol,
             "pcr_oi":       pcr_oi,
@@ -1465,6 +1563,7 @@ def fetch_options_flow(ticker_sym):
             "unusual_calls":unusual_calls,
             "unusual_puts": unusual_puts,
             "net_flow":     net_flow,
+            "max_pain":     max_pain,
             "expiry":       exps[0],
             "last_update":  datetime.now().strftime("%H:%M:%S"),
         }
@@ -1480,6 +1579,7 @@ def fetch_options_flow(ticker_sym):
                 "unusual_calls":unusual_calls,
                 "unusual_puts": unusual_puts,
                 "net_flow":     net_flow,
+                "max_pain":     max_pain,
             })
         sent    = "bull" if (pcr_vol and pcr_vol < PCR_BULL_THRESH) else "bear" if (pcr_vol and pcr_vol > PCR_BEAR_THRESH) else "neutral"
         pv_str  = f"{pcr_vol:.2f}" if pcr_vol is not None else "--"
@@ -1613,6 +1713,14 @@ async def scan_ticker(client, ticker, market_open):
         "tape_signal":     result['tape_signal'],
         "tape_mult":       result['tape_mult'],
         "net_flow":        result['net_flow'],
+        # Phase 9: pivot levels + key levels
+        "pivot_pp":   result['pivot_pp'],  "pivot_r1": result['pivot_r1'],
+        "pivot_r2":   result['pivot_r2'],  "pivot_r3": result['pivot_r3'],
+        "pivot_s1":   result['pivot_s1'],  "pivot_s2": result['pivot_s2'],
+        "pivot_s3":   result['pivot_s3'],
+        "prev_high":  result['prev_high'], "prev_low": result['prev_low'],
+        "prev_close": result['prev_close'],
+        "max_pain":   options_data.get(ticker, {}).get('max_pain'),
         # PCR from options_data (updated by fetch_options_flow, not per-scan)
         "pcr":          options_data.get(ticker, {}).get("pcr"),
         "pcr_oi":       options_data.get(ticker, {}).get("pcr_oi"),
@@ -2165,6 +2273,30 @@ function renderContextRow() {
       html += `<span class="ctx-badge ctx-neutral" title="Options volume">C:${(d2.call_vol/1000).toFixed(0)}k P:${(d2.put_vol/1000).toFixed(0)}k</span>`;
   }
 
+  // Phase 9: Pivot levels + key levels
+  if (d.pivot_pp != null) {
+    const abovePP = d.price > d.pivot_pp;
+    const ppCls = abovePP ? 'ctx-bull' : 'ctx-bear';
+    html += `<span class="ctx-badge ${ppCls}" title="Daily Pivot Point (prev day H+L+C)/3">PP $${d.pivot_pp.toFixed(2)} ${abovePP ? '▲' : '▼'}</span>`;
+    if (d.pivot_r1 != null && d.price >= d.pivot_r1)
+      html += `<span class="ctx-badge ctx-bull" title="Above R1 — first resistance cleared">↑R1 $${d.pivot_r1.toFixed(2)}</span>`;
+    else if (d.pivot_s1 != null && d.price <= d.pivot_s1)
+      html += `<span class="ctx-badge ctx-bear" title="Below S1 — first support broken">↓S1 $${d.pivot_s1.toFixed(2)}</span>`;
+  }
+  if (d.prev_high != null && d.prev_low != null) {
+    if (d.price > d.prev_high)
+      html += `<span class="ctx-badge ctx-bull" title="Above prior day high — breakout">▲PDH $${d.prev_high.toFixed(2)}</span>`;
+    else if (d.price < d.prev_low)
+      html += `<span class="ctx-badge ctx-bear" title="Below prior day low — breakdown">▼PDL $${d.prev_low.toFixed(2)}</span>`;
+    else
+      html += `<span class="ctx-badge ctx-neutral" title="Inside prior day range — PDH $${d.prev_high.toFixed(2)} / PDL $${d.prev_low.toFixed(2)}">Inside PDR</span>`;
+  }
+  if (d.max_pain != null && d.price != null) {
+    const mpDist = ((d.price - d.max_pain) / d.price * 100);
+    const mpCls = Math.abs(mpDist) < 0.3 ? 'ctx-neutral' : (mpDist > 0 ? 'ctx-bear' : 'ctx-bull');
+    html += `<span class="ctx-badge ${mpCls}" title="Options max pain — price gravitates here on expiry day">MaxPain $${d.max_pain.toFixed(0)} (${mpDist>0?'+':''}${mpDist.toFixed(2)}%)</span>`;
+  }
+
   // Institutional flow badges (amber/gold)
   const instStyle = 'background:#1a1200;color:#ffd700;border:1px solid #ffd70044';
   if (d.block_print_dir) {
@@ -2484,7 +2616,52 @@ function renderAnalytics() {
     Math.max(b.bull_score||0,b.bear_score||0) - Math.max(a.bull_score||0,a.bear_score||0)
   ).slice(0, 5);
 
-  panel.innerHTML = tradesHtml + `
+  // ── Key Levels section (Phase 9) ──────────────────────────────────────────
+  const kd = allData[curTicker] || {};
+  function lvlRow(label, val, color, bold) {
+    if (val == null) return '';
+    const dist = kd.price ? ((kd.price - val) / kd.price * 100) : null;
+    const distStr = dist != null ? ` <span style="color:#444;font-size:.65rem">(${dist>0?'+':''}${dist.toFixed(2)}%)</span>` : '';
+    return `<tr style="border-bottom:1px solid #0d0d0d${bold?';background:#111':''}">
+      <td style="padding:2px 6px;color:${bold?color:'#666'};font-weight:${bold?'600':'400'}">${label}</td>
+      <td style="text-align:right;padding:2px 6px;color:${color};font-weight:${bold?'600':'400'}">$${val.toFixed(2)}${distStr}</td>
+    </tr>`;
+  }
+  const keyLevelsHtml = (kd.pivot_pp != null) ? `
+<div style="border-bottom:1px solid #1a1a1a;padding-bottom:10px;margin-bottom:10px">
+  <div class="section-title">Key Levels — ${curTicker}</div>
+  <div class="row g-2">
+    <div class="col-6">
+      <div style="font-size:.7rem;color:#555;text-transform:uppercase;letter-spacing:.5px;margin-bottom:4px">Pivot Points</div>
+      <table style="width:100%;border-collapse:collapse;font-size:.75rem">
+        ${lvlRow('R3', kd.pivot_r3, '#00ff88', false)}
+        ${lvlRow('R2', kd.pivot_r2, '#00cc66', false)}
+        ${lvlRow('R1', kd.pivot_r1, '#00aa44', false)}
+        ${lvlRow('PP', kd.pivot_pp, '#ffaa00', true)}
+        ${lvlRow('S1', kd.pivot_s1, '#ff8888', false)}
+        ${lvlRow('S2', kd.pivot_s2, '#ff6666', false)}
+        ${lvlRow('S3', kd.pivot_s3, '#ff4444', false)}
+      </table>
+    </div>
+    <div class="col-6">
+      <div style="font-size:.7rem;color:#555;text-transform:uppercase;letter-spacing:.5px;margin-bottom:4px">Reference Levels</div>
+      <table style="width:100%;border-collapse:collapse;font-size:.75rem">
+        ${lvlRow('Prev High',  kd.prev_high,  '#aaa', false)}
+        ${lvlRow('Prev Close', kd.prev_close, '#666', false)}
+        ${lvlRow('Prev Low',   kd.prev_low,   '#aaa', false)}
+        ${kd.max_pain != null ? lvlRow('Max Pain', kd.max_pain, '#ffd700', true) : ''}
+        ${kd.orb_high != null ? lvlRow('ORB High', kd.orb_high, '#00ffcc', false) : ''}
+        ${kd.orb_low  != null ? lvlRow('ORB Low',  kd.orb_low,  '#ff9900', false) : ''}
+        ${kd.price != null ? `<tr style="border-top:1px solid #222;background:#0d0d0d">
+          <td style="padding:3px 6px;color:#fff;font-weight:700">Current</td>
+          <td style="text-align:right;padding:3px 6px;color:#fff;font-weight:700">$${kd.price.toFixed(2)}</td>
+        </tr>` : ''}
+      </table>
+    </div>
+  </div>
+</div>` : '';
+
+  panel.innerHTML = keyLevelsHtml + tradesHtml + `
 <div class="row g-2">
   <div class="col-12">
     <div class="d-flex flex-wrap gap-2" style="font-size:.78rem">
