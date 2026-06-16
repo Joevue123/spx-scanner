@@ -36,11 +36,27 @@ WATCHLIST             = ["SPY", "QQQ", "IWM", "NVDA", "AAPL"]
 SIGNAL_LOG_FILE       = "/tmp/signal_log.json"
 CSV_LOG_FILE          = "/tmp/signals.csv"
 HISTORY_FILE_TMPL     = "/tmp/score_history_{}.json"
-MAX_SCORE             = 42       # 41 + 1 sma200
+MAX_SCORE             = 100      # weighted 0-100 (INST 35 + LEVELS 20 + TECH 30 + PAT 10 + MKT 5)
 ALERT_COOLDOWN_SECS   = 900
 VOLUME_SPIKE_MULT     = 3.0
-ALERT_SCORE_THRESHOLD = 9
-LOG_SCORE_THRESHOLD   = 6
+ALERT_SCORE_THRESHOLD = 22      # ~22% conviction floor (was 9/42)
+LOG_SCORE_THRESHOLD   = 14      # ~14% log floor (was 6/42)
+
+# ── Weighted scoring architecture ─────────────────────────────────────────────
+CATEGORY_WEIGHTS = {
+    "INST":    35,   # Institutional flow — highest conviction
+    "LEVELS":  20,   # Structural key levels
+    "TECH":    30,   # Technical indicators
+    "PATTERN": 10,   # Candlestick/price patterns
+    "MARKET":   5,   # Regime/breadth (governor)
+}
+# Trend-following TECH signals penalised 50% when market is ranging/choppy
+TREND_SIGNALS = frozenset({
+    "sma20", "sma200", "ema9", "ema50",
+    "ema_cross", "supertrend", "ftfc",
+})
+RANGING_REGIMES    = frozenset({"ranging", "neutral"})
+TREND_MULT_RANGING = 0.5
 # Phase 14: CQ-gated alert routing
 # HIGH → Discord + Telegram + Email (starred message)
 # MED  → Discord + Telegram
@@ -1435,6 +1451,38 @@ def fetch_aggs(client, ticker, multiplier, days, limit=500):
         return None
 
 
+def _weighted_score(signals, regime):
+    """
+    Compute category-weighted confluence score (0-100).
+
+    Category weights: INST 35 | LEVELS 20 | TECH 30 | PATTERN 10 | MARKET 5
+    Regime governor: in ranging/neutral markets, trend-following TECH signals
+    (EMA, SMA, SuperTrend, FTFC) contribute only 0.5 to the active numerator,
+    reducing the TECH fill rate and suppressing false breakout scores.
+    """
+    is_ranging = regime in RANGING_REGIMES
+    cat_active = {k: 0.0 for k in CATEGORY_WEIGHTS}
+    cat_total  = {k: 0   for k in CATEGORY_WEIGHTS}
+
+    for key, sig in signals.items():
+        cat = SIGNAL_CATEGORIES.get(key)
+        if cat not in CATEGORY_WEIGHTS:
+            continue
+        cat_total[cat] += 1
+        if sig["active"]:
+            eff = TREND_MULT_RANGING if (is_ranging and cat == "TECH" and key in TREND_SIGNALS) else 1.0
+            cat_active[cat] += eff
+
+    score = 0.0
+    for cat, weight in CATEGORY_WEIGHTS.items():
+        total = cat_total[cat]
+        if total == 0:
+            continue
+        score += (cat_active[cat] / total) * weight
+
+    return round(score)
+
+
 def compute_signals(df_1m, df_5m, ticker=None, pm_high=None, pm_low=None):
     # ── 1m indicators ──────────────────────────────────────────────────────────
     df = df_1m.copy()
@@ -1988,7 +2036,7 @@ def compute_signals(df_1m, df_5m, ticker=None, pm_high=None, pm_low=None):
                             _valid(sma200_1m_val) and price    > sma200_1m_val,
                             _valid(sma200_5m_val) and price_5m > sma200_5m_val),
     }
-    bull_score = sum(s['points'] for s in bull.values() if s['active'])
+    bull_score = _weighted_score(bull, regime)
 
     # ── Bear signals ───────────────────────────────────────────────────────────
     sma_r1  = _valid(sma20_1m) and price    < sma20_1m
@@ -2060,7 +2108,7 @@ def compute_signals(df_1m, df_5m, ticker=None, pm_high=None, pm_low=None):
                             _valid(sma200_1m_val) and price    < sma200_1m_val,
                             _valid(sma200_5m_val) and price_5m < sma200_5m_val),
     }
-    bear_score = sum(s['points'] for s in bear.values() if s['active'])
+    bear_score = _weighted_score(bear, regime)
 
     # ── Phase 13: Per-category confluence breakdown ───────────────────────────
     def _cat_breakdown(signals):
@@ -2415,7 +2463,7 @@ async def scan_ticker(client, ticker, market_open):
 
     if not market_open:
         status = "MARKET_CLOSED"
-    elif score >= 8:
+    elif score >= 20:
         status = "NORMAL"
     else:
         status = "REDUCED_RISK"
@@ -3521,7 +3569,7 @@ function initChart() {
       interaction: {mode: 'index', intersect: false},
       scales: {
         x: {ticks:{color:'#444',maxTicksLimit:8,font:{size:9}}, grid:{color:'#1a1a1a'}},
-        y: {min:0, max:MAX_SCORE, ticks:{color:'#444',stepSize:5}, grid:{color:'#1a1a1a'}}
+        y: {min:0, max:MAX_SCORE, ticks:{color:'#444',stepSize:10}, grid:{color:'#1a1a1a'}}
       },
       plugins: {legend: {labels: {color:'#555', font:{size:9}, boxWidth:10, padding:5}}}
     }
@@ -4090,7 +4138,7 @@ async function update() {
       const prev    = prevScores[ticker] || {bull:0,bear:0};
       const newMax  = Math.max(d.bull_score, d.bear_score);
       const prevMax = Math.max(prev.bull,    prev.bear);
-      if (newMax >= 8 && newMax > prevMax) {
+      if (newMax >= 20 && newMax > prevMax) {
         const cqNow  = d.direction === 'BEAR' ? d.bear_cq : d.bull_cq;
         const cqRank = {HIGH:3, MED:2, LOW:1, WEAK:0}[cqNow] || 0;
         if      (cqRank >= 3) playAlert(1200, 3);
