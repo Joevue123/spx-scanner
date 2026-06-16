@@ -1205,6 +1205,8 @@ _blank_ticker = lambda t: {
     "obv_trend": None, "bull_velocity": None, "bear_velocity": None,
     # Phase 14
     "stochrsi_k": None, "stochrsi_d": None,
+    # Phase 20
+    "bull_score_peak": 0, "bear_score_peak": 0,
     # Phase 13
     "bull_breakdown": {}, "bear_breakdown": {},
     "bull_cq": "WEAK",   "bear_cq": "WEAK",
@@ -2396,6 +2398,11 @@ async def scan_ticker(client, ticker, market_open):
             history.pop(0)
         save_history(ticker, history)
 
+    bull_score_peak = max((h.get('bull_score', 0) for h in history), default=0)
+    bear_score_peak = max((h.get('bear_score', 0) for h in history), default=0)
+    bull_score_peak = max(bull_score_peak, int(bull_score))
+    bear_score_peak = max(bear_score_peak, int(bear_score))
+
     dashboard_data[ticker].update({
         "price":        price,
         "bull_score":   bull_score,
@@ -2482,6 +2489,9 @@ async def scan_ticker(client, ticker, market_open):
         "bear_breakdown": result.get('bear_breakdown', {}),
         "bull_cq":        result.get('bull_cq', 'WEAK'),
         "bear_cq":        result.get('bear_cq', 'WEAK'),
+        # Phase 20: session peaks
+        "bull_score_peak": bull_score_peak,
+        "bear_score_peak": bear_score_peak,
         # PCR from options_data (updated by fetch_options_flow, not per-scan)
         "pcr":          options_data.get(ticker, {}).get("pcr"),
         "pcr_oi":       options_data.get(ticker, {}).get("pcr_oi"),
@@ -2758,7 +2768,13 @@ DASHBOARD_HTML = """<!DOCTYPE html>
   <div class="row g-3 mb-3">
     <div class="col-md-5">
       <div class="card p-3">
-        <div class="section-title">Score History — <span id="chart-ticker">SPY</span></div>
+        <div class="section-title d-flex align-items-center justify-content-between">
+          <span>Score History <span id="chart-ticker" style="color:#aaa">— SPY</span></span>
+          <span style="display:inline-flex;gap:3px;flex-shrink:0">
+            <button id="chart-btn-multi"  onclick="setChartMode('multi')"  style="background:#0d2010;color:#00ff88;border:1px solid #00ff8844;border-radius:3px;padding:1px 6px;font-size:.6rem;cursor:pointer">Multi</button>
+            <button id="chart-btn-single" onclick="setChartMode('single')" style="background:transparent;color:#444;border:1px solid #222;border-radius:3px;padding:1px 6px;font-size:.6rem;cursor:pointer">Single</button>
+          </span>
+        </div>
         <canvas id="scoreChart"></canvas>
       </div>
     </div>
@@ -2822,6 +2838,8 @@ let curDir       = 'bull';
 let soundOn      = true;
 let prevScores   = {};
 let scoreChart   = null;
+let chartMode    = 'multi';
+const TICKER_COLORS = {SPY:'#00ff88',QQQ:'#00ccff',IWM:'#ffcc00',NVDA:'#ff7744',AAPL:'#bb88ff'};
 
 const MAX_SCORE           = """ + str(MAX_SCORE) + """;
 const ALERT_SCORE_THRESH  = """ + str(ALERT_SCORE_THRESHOLD) + """;
@@ -2991,6 +3009,7 @@ function renderTickerRow() {
           <div class="bar" style="width:${Math.min(score/MAX_SCORE*100,100)}%;background:${scoreColor(score)}"></div>
         </div>
         <div style="margin-top:3px;opacity:.75">${sparklineSvg(d.history)}</div>
+        <div style="font-size:.57rem;color:#2a2a2a;margin-top:1px">Peak ▲${d.bull_score_peak||0} ▼${d.bear_score_peak||0}</div>
       </div>`;
     row.appendChild(col);
   }
@@ -3283,7 +3302,20 @@ function renderCatBreakdown(breakdown, cq, vel) {
   const el = document.getElementById('cat-breakdown');
   if (!el) return;
   if (!breakdown || !breakdown.active) { el.innerHTML = ''; return; }
-  const m = CQ_META[cq] || CQ_META.WEAK;
+  const m     = CQ_META[cq] || CQ_META.WEAK;
+  const act   = breakdown.active || {};
+  const nCats = Object.values(act).filter(v=>v>0).length;
+  const tech  = act.TECH  || 0;
+  const inst  = act.INST  || 0;
+  let cqHint  = '';
+  if      (cq==='WEAK' && nCats<2) cqHint = `→ LOW: +${2-nCats} cat`;
+  else if (cq==='LOW'  && tech <3) cqHint = `→ MED: +${3-tech} TECH`;
+  else if (cq==='LOW'  && nCats<3) cqHint = `→ MED: +${3-nCats} cat`;
+  else if (cq==='MED'  && tech <3) cqHint = `→ HIGH: +${3-tech} TECH`;
+  else if (cq==='MED'  && inst <1) cqHint = '→ HIGH: +1 INST';
+  else if (cq==='MED'  && nCats<4) cqHint = `→ HIGH: +${4-nCats} cat`;
+  else if (cq==='HIGH')            cqHint = '★ Max tier';
+  const hintHtml = cqHint ? `<span style="font-size:.55rem;color:#555;white-space:nowrap;margin-left:2px">${cqHint}</span>` : '';
   const bars = CAT_ORDER.map(cat => {
     const active = (breakdown.active || {})[cat] || 0;
     const total  = (breakdown.total  || {})[cat] || 0;
@@ -3299,6 +3331,7 @@ function renderCatBreakdown(breakdown, cq, vel) {
   el.innerHTML = `<div style="display:flex;align-items:center;flex-wrap:wrap;gap:4px;padding:3px 0 5px;border-bottom:1px solid #181818;margin-bottom:5px">
     ${bars}
     <span style="margin-left:auto;font-size:.6rem;font-weight:bold;color:${m.clr};border:1px solid ${m.clr}55;padding:1px 6px;border-radius:3px;white-space:nowrap">${m.lbl}</span>
+    ${hintHtml}
     ${vel !== null && vel !== undefined ? velArrow(vel) : ''}
   </div>`;
 }
@@ -3417,35 +3450,71 @@ function renderAlerts() {
 }
 
 // ── Score Chart ───────────────────────────────────────────────────────────────
+function setChartMode(mode) {
+  chartMode = mode;
+  const btnM = document.getElementById('chart-btn-multi');
+  const btnS = document.getElementById('chart-btn-single');
+  const on  = 'background:#0d2010;color:#00ff88;border:1px solid #00ff8844;border-radius:3px;padding:1px 6px;font-size:.6rem;cursor:pointer';
+  const off = 'background:transparent;color:#444;border:1px solid #222;border-radius:3px;padding:1px 6px;font-size:.6rem;cursor:pointer';
+  if (btnM) btnM.style.cssText  = mode === 'multi'  ? on : off;
+  if (btnS) btnS.style.cssText  = mode === 'single' ? on : off;
+  updateChart();
+}
+
 function initChart() {
   const ctx = document.getElementById('scoreChart').getContext('2d');
   scoreChart = new Chart(ctx, {
     type: 'line',
-    data: {
-      labels: [],
-      datasets: [
-        {label:'Bull',data:[],borderColor:'#00ff88',backgroundColor:'rgba(0,255,136,.06)',tension:.3,pointRadius:2,fill:true},
-        {label:'Bear',data:[],borderColor:'#ff6666',backgroundColor:'rgba(255,100,100,.05)',tension:.3,pointRadius:2,fill:true}
-      ]
-    },
+    data: { labels: [], datasets: [] },
     options: {
-      responsive:true, animation:{duration:250},
-      interaction:{mode:'index',intersect:false},
-      scales:{
-        x:{ticks:{color:'#444',maxTicksLimit:8,font:{size:9}}, grid:{color:'#1a1a1a'}},
-        y:{min:0,max:MAX_SCORE,ticks:{color:'#444',stepSize:2},grid:{color:'#1a1a1a'}}
+      responsive: true, animation: {duration: 150},
+      interaction: {mode: 'index', intersect: false},
+      scales: {
+        x: {ticks:{color:'#444',maxTicksLimit:8,font:{size:9}}, grid:{color:'#1a1a1a'}},
+        y: {min:0, max:MAX_SCORE, ticks:{color:'#444',stepSize:5}, grid:{color:'#1a1a1a'}}
       },
-      plugins:{legend:{labels:{color:'#555',font:{size:10}}}}
+      plugins: {legend: {labels: {color:'#555', font:{size:9}, boxWidth:10, padding:5}}}
     }
   });
 }
 
 function updateChart() {
-  const d = allData[curTicker];
-  if (!d || !d.history || d.history.length === 0 || !scoreChart) return;
-  scoreChart.data.labels           = d.history.map(h => h.time);
-  scoreChart.data.datasets[0].data = d.history.map(h => h.bull_score);
-  scoreChart.data.datasets[1].data = d.history.map(h => h.bear_score);
+  if (!scoreChart || !allData) return;
+  const tickers = Object.keys(allData);
+  if (!tickers.length) return;
+
+  if (chartMode === 'multi') {
+    const maxLen = Math.max(...tickers.map(t => (allData[t].history || []).length), 1);
+    const labelTicker = tickers.reduce((a, b) =>
+      (allData[a].history||[]).length >= (allData[b].history||[]).length ? a : b, tickers[0]);
+    const labels = (allData[labelTicker].history || []).map(h => h.time);
+    scoreChart.data.labels = labels;
+    scoreChart.data.datasets = tickers.map(t => {
+      const hist = allData[t].history || [];
+      const pad  = maxLen - hist.length;
+      return {
+        label: t,
+        data: [...Array(pad).fill(null), ...hist.map(h => h.bull_score)],
+        borderColor: TICKER_COLORS[t] || '#888',
+        backgroundColor: 'transparent',
+        tension: 0.3,
+        pointRadius: 0,
+        borderWidth: t === curTicker ? 2.5 : 1.2,
+      };
+    });
+  } else {
+    const d = allData[curTicker];
+    if (!d || !d.history || !d.history.length) return;
+    scoreChart.data.labels = d.history.map(h => h.time);
+    scoreChart.data.datasets = [
+      {label:'Bull', data: d.history.map(h => h.bull_score),
+       borderColor:'#00ff88', backgroundColor:'rgba(0,255,136,.06)',
+       tension:.3, pointRadius:2, borderWidth:2, fill:true},
+      {label:'Bear', data: d.history.map(h => h.bear_score),
+       borderColor:'#ff6666', backgroundColor:'rgba(255,100,100,.05)',
+       tension:.3, pointRadius:2, borderWidth:1.5, fill:true},
+    ];
+  }
   scoreChart.update('none');
 }
 
@@ -3504,7 +3573,8 @@ function renderHeatmap() {
   for (const cat of cats) {
     html += `<th style="padding:3px 4px;text-align:center;color:${catClrs[cat]}">${cat.slice(0,3)}</th>`;
   }
-  html += `<th style="padding:3px 4px;text-align:left">Setup</th></tr></thead><tbody>`;
+  html += `<th style="padding:3px 4px;text-align:left">Setup</th>
+    <th style="padding:3px 4px;text-align:center">Peak</th></tr></thead><tbody>`;
 
   for (const [ticker, d] of Object.entries(allData)) {
     const dir      = d.direction || 'NEUTRAL';
@@ -3548,8 +3618,14 @@ function renderHeatmap() {
       </td>`;
     }
 
+    const peakVal = activeDir === 'bear' ? (d.bear_score_peak||0) : (d.bull_score_peak||0);
+    const peakPct = peakVal / MAX_SCORE;
+    const peakClr = peakPct >= 0.65 ? '#00ff88' : peakPct >= 0.45 ? '#aaff00' : peakPct >= 0.28 ? '#ffaa00' : '#555';
     html += `<td style="padding:3px 6px;font-size:.7rem">
       <span style="color:${grd.c};font-weight:700">${grd.g}</span>
+    </td>
+    <td style="padding:3px 4px;text-align:center;font-size:.62rem">
+      <span style="color:${peakClr}">${peakVal}</span>
     </td></tr>`;
   }
 
