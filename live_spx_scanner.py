@@ -36,7 +36,7 @@ WATCHLIST             = ["SPY", "QQQ", "IWM", "NVDA", "AAPL"]
 SIGNAL_LOG_FILE       = "/tmp/signal_log.json"
 CSV_LOG_FILE          = "/tmp/signals.csv"
 HISTORY_FILE_TMPL     = "/tmp/score_history_{}.json"
-MAX_SCORE             = 41       # 39 + 1 ema_cross + 1 consec_bars
+MAX_SCORE             = 42       # 41 + 1 sma200
 ALERT_COOLDOWN_SECS   = 900
 VOLUME_SPIKE_MULT     = 3.0
 ALERT_SCORE_THRESHOLD = 9
@@ -107,6 +107,7 @@ SIGNAL_CATEGORIES = {
     "vpoc_bull":"LEVELS","vpoc_bear":"LEVELS",
     "above_vah":"LEVELS","below_val":"LEVELS",
     "session_range":"LEVELS",
+    "sma200":       "TECH",
     # INST — institutional and smart-money flow
     "block_print":"INST","flow_unusual":"INST","vol_delta":"INST",
     "vwap_def":"INST",  "tape_read":"INST",  "obv":"INST",
@@ -1205,6 +1206,8 @@ _blank_ticker = lambda t: {
     "obv_trend": None, "bull_velocity": None, "bear_velocity": None,
     # Phase 14
     "stochrsi_k": None, "stochrsi_d": None,
+    # Phase 22
+    "sma200_1m": None, "sma200_5m": None,
     # Phase 20
     "bull_score_peak": 0, "bear_score_peak": 0,
     # Phase 13
@@ -1572,6 +1575,21 @@ def compute_signals(df_1m, df_5m, ticker=None, pm_high=None, pm_low=None):
     df5['st']    = st5_df.iloc[:, 0]
     df5 = df5.bfill()
 
+    # ── Phase 22: SMA200 on 1m + 5m ─────────────────────────────────────────
+    sma200_1m_val = sma200_5m_val = None
+    try:
+        s200 = ta.sma(df['Close'], length=200)
+        if s200 is not None and _valid(s200.iloc[-1]):
+            sma200_1m_val = round(float(s200.iloc[-1]), 2)
+    except Exception:
+        pass
+    try:
+        s200_5 = ta.sma(df5['Close'], length=200)
+        if s200_5 is not None and _valid(s200_5.iloc[-1]):
+            sma200_5m_val = round(float(s200_5.iloc[-1]), 2)
+    except Exception:
+        pass
+
     # ── VWAP (today's 1m data) ────────────────────────────────────────────────
     last_day    = df['date'].iloc[-1]
     today_df    = df[df['date'] == last_day].copy().reset_index(drop=True)
@@ -1866,6 +1884,14 @@ def compute_signals(df_1m, df_5m, ticker=None, pm_high=None, pm_low=None):
         if tf5 is not None: d["tf5"] = bool(tf5)
         return d
 
+    # ── Phase 22: SMA200 signal booleans ────────────────────────────────────
+    sma200_b = (_valid(sma200_1m_val) and price    > sma200_1m_val and
+                _valid(sma200_5m_val) and price_5m > sma200_5m_val)
+    sma200_r = (_valid(sma200_1m_val) and price    < sma200_1m_val and
+                _valid(sma200_5m_val) and price_5m < sma200_5m_val)
+    sma200_lbl = (f"1m:{sma200_1m_val:.2f} 5m:{sma200_5m_val:.2f}"
+                  if sma200_1m_val is not None else "--")
+
     # ── Bull signals ───────────────────────────────────────────────────────────
     sma_b1 = _valid(sma20_1m) and price    > sma20_1m
     sma_b5 = _valid(sma20_5m) and price_5m > sma20_5m
@@ -1957,6 +1983,10 @@ def compute_signals(df_1m, df_5m, ticker=None, pm_high=None, pm_low=None):
         # ── Phase 16: Session range ────────────────────────────────────────────
         "session_range": bs("Session Low Zone",1, session_range_bull,
                             f"{range_pos_pct:.0f}% of rng" if range_pos_pct is not None else "--"),
+        # ── Phase 22: SMA200 MTF ──────────────────────────────────────────────
+        "sma200":        bs("SMA200 MTF ↑",   1, sma200_b, sma200_lbl,
+                            _valid(sma200_1m_val) and price    > sma200_1m_val,
+                            _valid(sma200_5m_val) and price_5m > sma200_5m_val),
     }
     bull_score = sum(s['points'] for s in bull.values() if s['active'])
 
@@ -2025,6 +2055,10 @@ def compute_signals(df_1m, df_5m, ticker=None, pm_high=None, pm_low=None):
         # ── Phase 16: Session range ────────────────────────────────────────────
         "session_range": bs("Session High Zone",1, session_range_bear,
                             f"{range_pos_pct:.0f}% of rng" if range_pos_pct is not None else "--"),
+        # ── Phase 22: SMA200 MTF ──────────────────────────────────────────────
+        "sma200":        bs("SMA200 MTF ↓",   1, sma200_r, sma200_lbl,
+                            _valid(sma200_1m_val) and price    < sma200_1m_val,
+                            _valid(sma200_5m_val) and price_5m < sma200_5m_val),
     }
     bear_score = sum(s['points'] for s in bear.values() if s['active'])
 
@@ -2117,6 +2151,9 @@ def compute_signals(df_1m, df_5m, ticker=None, pm_high=None, pm_low=None):
         # Phase 14: Stochastic RSI
         "stochrsi_k": stochrsi_k,
         "stochrsi_d": stochrsi_d,
+        # Phase 22: SMA200
+        "sma200_1m": sma200_1m_val,
+        "sma200_5m": sma200_5m_val,
         # Phase 18: EMA50 + PM levels
         "ema50_1m": ema50_1m_val,
         "pm_high":  pm_high,
@@ -2461,6 +2498,9 @@ async def scan_ticker(client, ticker, market_open):
         "vp_profile": result['vp_profile'],
         "vwap_1u": result['vwap_1u'], "vwap_1d": result['vwap_1d'],
         "vwap_2u": result['vwap_2u'], "vwap_2d": result['vwap_2d'],
+        # Phase 22
+        "sma200_1m": result.get('sma200_1m'),
+        "sma200_5m": result.get('sma200_5m'),
         # Phase 18
         "ema50_1m": result.get('ema50_1m'),
         "pm_high":  result.get('pm_high'),
@@ -2896,13 +2936,15 @@ async function requestNotifPermission() {
   updateNotifBtn();
 }
 
-function fireNotification(ticker, direction, score) {
+function fireNotification(ticker, direction, score, cq, price) {
   if (!notifGranted) return;
-  const emoji = direction === 'BULL' ? '🚀' : '🔻';
+  const emoji  = direction === 'BULL' ? '🚀' : '🔻';
+  const cqStr  = {HIGH:'★ HIGH',MED:'◆ MED',LOW:'▲ LOW',WEAK:'WEAK'}[cq] || (cq || '');
+  const priceStr = price != null ? `$${parseFloat(price).toFixed(2)}` : '';
   try {
-    new Notification(`${emoji} ${ticker} ${direction} — ${score}/${MAX_SCORE}`, {
-      body: `Confluence score ${score}/${MAX_SCORE} — check the scanner`,
-      tag: ticker,
+    new Notification(`${emoji} ${ticker} ${direction} ${score}/${MAX_SCORE}  ${cqStr}`, {
+      body: `${priceStr ? 'Price: ' + priceStr + '  |  ' : ''}Score: ${score}/${MAX_SCORE}  |  CQ: ${cqStr}`,
+      tag:  `${ticker}-${direction}`,
       silent: false,
     });
   } catch(e) {}
@@ -3254,6 +3296,13 @@ function renderContextRow() {
     const above50 = d.price > d.ema50_1m;
     const e50Cls  = above50 ? 'ctx-bull' : 'ctx-bear';
     html += `<span class="ctx-badge ${e50Cls}" title="EMA50 on 1-minute chart — 50-minute session trend. With EMA9+SMA20 forms a full trend stack.">EMA50 $${d.ema50_1m.toFixed(2)} ${above50 ? '▲' : '▼'}</span>`;
+  }
+  if (d.sma200_1m != null && d.price != null) {
+    const above200 = d.price > d.sma200_1m;
+    const s200Cls  = above200 ? 'ctx-bull' : 'ctx-bear';
+    const dist200  = ((d.price - d.sma200_1m) / d.sma200_1m * 100);
+    const distStr  = `${dist200 >= 0 ? '+' : ''}${dist200.toFixed(2)}%`;
+    html += `<span class="ctx-badge ${s200Cls}" title="SMA200 on 1-minute chart — key institutional reference; below is macro bearish, above is macro bullish. 5m SMA200: $${d.sma200_5m != null ? d.sma200_5m.toFixed(2) : '--'}">SMA200 $${d.sma200_1m.toFixed(2)} ${above200 ? '▲' : '▼'} ${distStr}</span>`;
   }
   // Phase 18: PM High/Low badges
   if (d.pm_high != null && d.price != null) {
@@ -4042,8 +4091,14 @@ async function update() {
       const newMax  = Math.max(d.bull_score, d.bear_score);
       const prevMax = Math.max(prev.bull,    prev.bear);
       if (newMax >= 8 && newMax > prevMax) {
-        playAlert(newMax >= 11 ? 1100 : 880, newMax >= 11 ? 3 : 2);
-        if (newMax >= ALERT_SCORE_THRESH) fireNotification(ticker, d.direction, newMax);
+        const cqNow  = d.direction === 'BEAR' ? d.bear_cq : d.bull_cq;
+        const cqRank = {HIGH:3, MED:2, LOW:1, WEAK:0}[cqNow] || 0;
+        if      (cqRank >= 3) playAlert(1200, 3);
+        else if (cqRank >= 2) playAlert(880,  2);
+        else if (cqRank >= 1) playAlert(660,  1);
+        if (newMax >= ALERT_SCORE_THRESH && cqRank >= 2) {
+          fireNotification(ticker, d.direction, newMax, cqNow, d.price);
+        }
       }
       prevScores[ticker] = {bull: d.bull_score, bear: d.bear_score};
       if (d.last_update !== 'N/A') latestUpdate = d.last_update;
