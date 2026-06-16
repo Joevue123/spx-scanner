@@ -2518,6 +2518,7 @@ async def scan_ticker(client, ticker, market_open):
             "tp":         result['bull_tp']   if direction != "BEAR" else result['bear_tp'],
             "gap_pct":    result['gap_pct'],
             "orb_break":  result['orb_high'] is not None and direction == 'BULL' and price > result['orb_high'],
+            "cq":         cq_now,
         }
         signal_log.insert(0, entry)
         signal_log = signal_log[:200]
@@ -2805,11 +2806,11 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       <table class="log-table">
         <thead><tr>
           <th>Time</th><th>Ticker</th><th>Price</th>
-          <th>Bull</th><th>Bear</th><th>Dir</th>
+          <th>Bull</th><th>Bear</th><th>Dir</th><th>CQ</th>
           <th>ATR</th><th>Stop</th><th>TP</th><th>Gap</th><th>Vol</th>
         </tr></thead>
         <tbody id="log-body">
-          <tr><td colspan="11" style="color:#555;text-align:center;padding:12px">No setups logged yet</td></tr>
+          <tr><td colspan="12" style="color:#555;text-align:center;padding:12px">No setups logged yet</td></tr>
         </tbody>
       </table>
     </div>
@@ -3656,6 +3657,32 @@ function renderAnalytics() {
   const pf     = grossL > 0 ? (grossW/grossL).toFixed(2) : (grossW > 0 ? '∞' : '--');
   const totalR = rVals.reduce((a,b)=>a+b,0).toFixed(2);
 
+  // Per-ticker outcome breakdown
+  const byTickerOuts = {};
+  for (const o of ots) {
+    if (!byTickerOuts[o.ticker]) byTickerOuts[o.ticker] = {w:0, l:0, to:0, rVals:[]};
+    const b = byTickerOuts[o.ticker];
+    if (o.result==='WIN') b.w++; else if (o.result==='LOSS') b.l++; else b.to++;
+    if (o.r_multiple != null) b.rVals.push(o.r_multiple);
+  }
+  const tkRows = Object.entries(byTickerOuts)
+    .filter(([,b]) => b.w+b.l+b.to > 0)
+    .sort(([,a],[,b]) => (b.w+b.l+b.to)-(a.w+a.l+a.to))
+    .map(([tk, b]) => {
+      const tot  = b.w + b.l + b.to;
+      const wr   = tot ? Math.round(b.w/tot*100) : 0;
+      const avgR = b.rVals.length ? b.rVals.reduce((a,c)=>a+c,0)/b.rVals.length : null;
+      const rStr = avgR !== null ? `${avgR>=0?'+':''}${avgR.toFixed(2)}R` : '--R';
+      const rClr = avgR === null ? '#555' : avgR >= 0 ? '#00ff88' : '#ff6666';
+      const wrClr= wr >= 60 ? '#00ff88' : wr >= 45 ? '#ffaa00' : '#ff6666';
+      return `<span style="font-size:.63rem;color:#555;border:1px solid #1a1a1a;padding:2px 6px;border-radius:3px;white-space:nowrap">
+        <span style="color:#aaa;font-weight:600">${tk}</span>
+        <span style="color:${wrClr};margin-left:3px">${b.w}W/${b.l}L${b.to?`/${b.to}T`:''}</span>
+        <span style="color:${wrClr};margin-left:2px">(${wr}%)</span>
+        <span style="color:${rClr};margin-left:3px">${rStr}</span>
+      </span>`;
+    }).join('');
+
   // Equity sparkline: cumulative R over closed trades
   let cumR = 0;
   const cumRseries = ots.map(o => { cumR += (o.r_multiple || 0); return cumR; });
@@ -3691,20 +3718,29 @@ function renderAnalytics() {
     ${avgR != null ? `<span class="ctx-badge ${parseFloat(avgR)>=0?'ctx-bull':'ctx-bear'}">Avg R: ${parseFloat(avgR)>0?'+':''}${avgR}</span>` : ''}
     <span class="ctx-badge ctx-neutral">PF: ${pf}</span>
     <span class="ctx-badge ${parseFloat(totalR)>=0?'ctx-bull':'ctx-bear'}">Total R: ${parseFloat(totalR)>0?'+':''}${totalR}</span>
-  </div>`}
+  </div>
+  ${tkRows ? `<div style="display:flex;flex-wrap:wrap;gap:3px;margin-bottom:6px">${tkRows}</div>` : ''}`}
   ${opens.length > 0 ? `
   <div class="section-title mt-2">Open Positions (${opens.length})</div>
   ${opens.map(t => {
-    const dc = t.direction==='BULL'?'#00ff88':'#ff6666';
+    const dc      = t.direction==='BULL'?'#00ff88':'#ff6666';
     const elapsed = Math.round((Date.now()/1000 - t.open_ts)/60);
+    const cur     = (allData[t.ticker] || {}).price || null;
+    const pnlPts  = cur !== null ? (t.direction==='BULL' ? cur-t.entry : t.entry-cur) : null;
+    const risk    = Math.abs(t.entry - t.stop);
+    const pnlR    = (pnlPts !== null && risk > 0) ? pnlPts/risk : null;
+    const pnlClr  = pnlPts === null ? '#444' : pnlPts >= 0 ? '#00ff88' : '#ff6666';
+    const pnlStr  = pnlPts !== null
+      ? `${pnlPts>=0?'+':''}${pnlPts.toFixed(2)}${pnlR!==null?` (${pnlR>=0?'+':''}${pnlR.toFixed(2)}R)`:''}`
+      : '–';
     return `<div style="font-size:.74rem;padding:3px 0;border-bottom:1px solid #0d0d0d">
       <span style="color:${dc};font-weight:600">${t.direction}</span>
       <span class="ms-1 fw-bold">${t.ticker}</span>
-      <span class="ms-1" style="color:#777">entry $${t.entry.toFixed(2)}</span>
+      <span class="ms-1" style="color:#777">@ $${t.entry.toFixed(2)}</span>
       <span class="ms-1" style="color:#ff6666">SL $${t.stop.toFixed(2)}</span>
       <span class="ms-1" style="color:#00ff88">TP $${t.tp.toFixed(2)}</span>
-      <span class="ms-2" style="color:#555">[${t.score}/${MAX_SCORE}]</span>
-      <span class="ms-2" style="color:#444">${elapsed}m ago</span>
+      <span class="ms-2 fw-bold" style="color:${pnlClr}">${pnlStr}</span>
+      <span class="ms-2" style="color:#444">[${t.score}/${MAX_SCORE}] ${elapsed}m</span>
     </div>`;
   }).join('')}` : ''}
   ${ots.length > 0 ? `
@@ -3914,17 +3950,19 @@ function renderAnalytics() {
   <div class="col-12 col-md-3">
     <div class="section-title">Top Setups</div>
     ${top5.map(e => {
-      const score = Math.max(e.bull_score||0, e.bear_score||0);
-      const dc    = e.direction==='BULL'?'#00ff88':'#ff6666';
-      const vol   = e.vol_spike ? ' ⚡' : '';
-      const gap   = e.gap_pct != null ? ` ${e.gap_pct>0?'+':''}${parseFloat(e.gap_pct).toFixed(1)}%` : '';
-      const ts    = (e.time||'').slice(11,16);
+      const score  = Math.max(e.bull_score||0, e.bear_score||0);
+      const dc     = e.direction==='BULL'?'#00ff88':'#ff6666';
+      const vol    = e.vol_spike ? ' ⚡' : '';
+      const gap    = e.gap_pct != null ? ` ${e.gap_pct>0?'+':''}${parseFloat(e.gap_pct).toFixed(1)}%` : '';
+      const ts     = (e.time||'').slice(11,16);
+      const cqM    = e.cq ? (CQ_META[e.cq] || null) : null;
+      const cqBadge= cqM ? `<span style="font-size:.52rem;font-weight:bold;color:${cqM.clr};border:1px solid ${cqM.clr}33;padding:0 3px;border-radius:2px;margin-left:3px">${cqM.lbl}</span>` : '';
       return `<div style="padding:4px 0;border-bottom:1px solid #111;font-size:.73rem">
         <span style="color:#555">${ts}</span>
         <span class="ms-1 fw-bold">${e.ticker}</span>
         <span class="ms-1" style="color:#777">$${parseFloat(e.price||0).toFixed(0)}</span>
         <span class="ms-1 fw-bold" style="color:${dc}">${e.direction}</span>
-        <span class="ms-1" style="color:#aaa">${score}/${MAX_SCORE}${vol}${gap}</span>
+        <span class="ms-1" style="color:#aaa">${score}/${MAX_SCORE}${vol}${gap}</span>${cqBadge}
       </div>`;
     }).join('')}
   </div>
@@ -3947,6 +3985,7 @@ function renderLog() {
       <td class="log-bull">${e.bull_score}</td>
       <td class="log-bear">${e.bear_score}</td>
       <td class="${dc} fw-bold">${e.direction}</td>
+      <td>${e.cq ? `<span style="font-size:.6rem;font-weight:bold;color:${(CQ_META[e.cq]||{}).clr||'#555'};white-space:nowrap">${(CQ_META[e.cq]||{}).lbl||e.cq}</span>` : '–'}</td>
       <td style="color:#ffaa00">${e.atr ? e.atr.toFixed(2) : '--'}</td>
       <td style="color:#ff6666">${e.stop ? '$'+e.stop.toFixed(2) : '--'}</td>
       <td style="color:#00ff88">${e.tp   ? '$'+e.tp.toFixed(2)   : '--'}</td>
