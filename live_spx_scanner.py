@@ -36,7 +36,7 @@ WATCHLIST             = ["SPY", "QQQ", "IWM", "NVDA", "AAPL"]
 SIGNAL_LOG_FILE       = "/tmp/signal_log.json"
 CSV_LOG_FILE          = "/tmp/signals.csv"
 HISTORY_FILE_TMPL     = "/tmp/score_history_{}.json"
-MAX_SCORE             = 37       # 36 + 1 ema9
+MAX_SCORE             = 39       # 37 + 1 ema50 + 1 pm_break
 ALERT_COOLDOWN_SECS   = 900
 VOLUME_SPIKE_MULT     = 3.0
 ALERT_SCORE_THRESHOLD = 9
@@ -91,7 +91,7 @@ RS_LAGGER_THRESH      = -0.15   # ticker underperforming SPY by ≥0.15% = RS la
 # ── Phase 13: Signal category mapping ───────────────────────────────────────
 SIGNAL_CATEGORIES = {
     # TECH — core momentum and trend indicators
-    "sma20":"TECH",    "adx":"TECH",     "rsi":"TECH",   "ftfc":"TECH",  "ema9":"TECH",
+    "sma20":"TECH",    "adx":"TECH",     "rsi":"TECH",   "ftfc":"TECH",  "ema9":"TECH",  "ema50":"TECH",
     "supertrend":"TECH","heikin_ashi":"TECH","vwap":"TECH","bb":"TECH",
     "macd":"TECH",     "rsi_div":"TECH", "stochrsi":"TECH",
     # PATTERN — price action and candle structure
@@ -100,6 +100,7 @@ SIGNAL_CATEGORIES = {
     # LEVELS — key price levels and structural zones
     "pivot_bull":"LEVELS","pivot_bear":"LEVELS",
     "pdh_break":"LEVELS", "pdl_break":"LEVELS",
+    "pm_high_break":"LEVELS","pm_low_break":"LEVELS",
     "fib_support":"LEVELS","fib_resist":"LEVELS","fib_ext":"LEVELS",
     "vpoc_bull":"LEVELS","vpoc_bear":"LEVELS",
     "above_vah":"LEVELS","below_val":"LEVELS",
@@ -1190,6 +1191,8 @@ _blank_ticker = lambda t: {
     # Phase 12
     "vpoc": None, "vah": None, "val": None, "vp_profile": [],
     "vwap_1u": None, "vwap_1d": None, "vwap_2u": None, "vwap_2d": None,
+    # Phase 18
+    "ema50_1m": None, "pm_high": None, "pm_low": None,
     # Phase 17
     "ema9_1m": None, "range_vs_atr": None, "vwap_dist_atr": None,
     # Phase 16
@@ -1425,7 +1428,7 @@ def fetch_aggs(client, ticker, multiplier, days, limit=500):
         return None
 
 
-def compute_signals(df_1m, df_5m, ticker=None):
+def compute_signals(df_1m, df_5m, ticker=None, pm_high=None, pm_low=None):
     # ── 1m indicators ──────────────────────────────────────────────────────────
     df = df_1m.copy()
     df['sma20'] = ta.sma(df['Close'], length=20)
@@ -1483,6 +1486,15 @@ def compute_signals(df_1m, df_5m, ticker=None):
         ema9_s = ta.ema(df['Close'], length=9)
         if ema9_s is not None and _valid(ema9_s.iloc[-1]):
             ema9_1m_val = round(float(ema9_s.iloc[-1]), 2)
+    except Exception:
+        pass
+
+    # ── Phase 18: EMA50 on 1m ────────────────────────────────────────────────
+    ema50_1m_val = None
+    try:
+        ema50_s = ta.ema(df['Close'], length=50)
+        if ema50_s is not None and _valid(ema50_s.iloc[-1]):
+            ema50_1m_val = round(float(ema50_s.iloc[-1]), 2)
     except Exception:
         pass
 
@@ -1849,13 +1861,19 @@ def compute_signals(df_1m, df_5m, ticker=None):
     )
     _srsi_val = f"K:{stochrsi_k} D:{stochrsi_d}" if stochrsi_k is not None else "--"
 
-    ema9_b = _valid(ema9_1m_val) and price    > ema9_1m_val
-    ema9_r = _valid(ema9_1m_val) and price    < ema9_1m_val
+    ema9_b  = _valid(ema9_1m_val)  and price > ema9_1m_val
+    ema9_r  = _valid(ema9_1m_val)  and price < ema9_1m_val
     ema9_lbl = f"{ema9_1m_val:.2f}" if ema9_1m_val is not None else "--"
+    ema50_b = _valid(ema50_1m_val) and price > ema50_1m_val
+    ema50_r = _valid(ema50_1m_val) and price < ema50_1m_val
+    ema50_lbl = f"{ema50_1m_val:.2f}" if ema50_1m_val is not None else "--"
+    pm_high_b = pm_high is not None and price > pm_high
+    pm_low_r  = pm_low  is not None and price < pm_low
 
     bull = {
         "sma20":       bs("SMA20 MTF",      2, sma_b1 and sma_b5,      f"{sma20_1m:.2f}" if _valid(sma20_1m) else "--",  sma_b1, sma_b5),
         "ema9":        bs("EMA9 ↑",           1, ema9_b,                 ema9_lbl),
+        "ema50":       bs("EMA50 ↑",         1, ema50_b,                ema50_lbl),
         "adx":         bs("ADX Bull",        1, adx_b,                  f"{adx_val:.1f}"  if _valid(adx_val)  else "--"),
         "rsi":         bs("RSI 45-65",       1, rsi_b,                  f"{rsi_1m:.1f}"   if _valid(rsi_1m)   else "--"),
         "ftfc":        bs("FTFC MTF",        2, ftfc_b1 and ftfc_b5,    f"{ftfc_1m*100:.0f}%" if _valid(ftfc_1m) else "--", ftfc_b1, ftfc_b5),
@@ -1884,6 +1902,7 @@ def compute_signals(df_1m, df_5m, ticker=None):
         # ── Pivot / key levels (Phase 9) ──────────────────────────────────────
         "pivot_bull":  bs("Above Pivot PP",   1, pivot_bull_ok,           pp_str),
         "pdh_break":   bs("PDH Breakout",     1, pdh_break_ok,            pdh_str),
+        "pm_high_break":bs("PM High Break ↑", 1, pm_high_b,               f"${pm_high:.2f}" if pm_high else "--"),
         # ── Candle patterns + regime (Phase 10) ───────────────────────────────
         "candle_bull": bs("Candle Pattern ↑", 1, candle_bull_pat is not None, candle_bull_pat or "None"),
         "regime_bull": bs("Regime: Bull",     1, regime_bull_ok,          regime_label),
@@ -1920,6 +1939,7 @@ def compute_signals(df_1m, df_5m, ticker=None):
     bear = {
         "sma20":       bs("SMA20 MTF",       2, sma_r1 and sma_r5,     f"{sma20_1m:.2f}" if _valid(sma20_1m) else "--",  sma_r1, sma_r5),
         "ema9":        bs("EMA9 ↓",            1, ema9_r,                ema9_lbl),
+        "ema50":       bs("EMA50 ↓",          1, ema50_r,               ema50_lbl),
         "adx":         bs("ADX Bear",         1, adx_r,                 f"{adx_val:.1f}"  if _valid(adx_val)  else "--"),
         "rsi":         bs("RSI 35-55",        1, rsi_r,                 f"{rsi_1m:.1f}"   if _valid(rsi_1m)   else "--"),
         "ftfc":        bs("FTFC Bear MTF",    2, ftfc_r1 and ftfc_r5,   f"{(1-ftfc_1m)*100:.0f}%" if _valid(ftfc_1m) else "--", ftfc_r1, ftfc_r5),
@@ -1948,6 +1968,7 @@ def compute_signals(df_1m, df_5m, ticker=None):
         # ── Pivot / key levels (Phase 9) ──────────────────────────────────────
         "pivot_bear":  bs("Below Pivot PP",   1, pivot_bear_ok,           pp_str),
         "pdl_break":   bs("PDL Breakdown",    1, pdl_break_ok,            pdl_str),
+        "pm_low_break":bs("PM Low Break ↓",   1, pm_low_r,                f"${pm_low:.2f}" if pm_low else "--"),
         # ── Candle patterns + regime (Phase 10) ───────────────────────────────
         "candle_bear": bs("Candle Pattern ↓", 1, candle_bear_pat is not None, candle_bear_pat or "None"),
         "regime_bear": bs("Regime: Bear",     1, regime_bear_ok,          regime_label),
@@ -2052,6 +2073,10 @@ def compute_signals(df_1m, df_5m, ticker=None):
         # Phase 14: Stochastic RSI
         "stochrsi_k": stochrsi_k,
         "stochrsi_d": stochrsi_d,
+        # Phase 18: EMA50 + PM levels
+        "ema50_1m": ema50_1m_val,
+        "pm_high":  pm_high,
+        "pm_low":   pm_low,
         # Phase 17: EMA9 + range/VWAP analysis
         "ema9_1m":      ema9_1m_val,
         "range_vs_atr": range_vs_atr,
@@ -2274,8 +2299,10 @@ async def scan_ticker(client, ticker, market_open):
     if len(df_5m) < 20:
         df_5m = df_1m
 
-    # ── Pre-market gap: compare today's pre-market bars to yesterday RTH close ─
+    # ── Pre-market gap + Phase 18 PM high/low ────────────────────────────────
     pm_gap_pct = None
+    pm_high    = None
+    pm_low     = None
     try:
         if len(df_1m) >= 2:
             _last_rth_day  = df_1m['date'].iloc[-1]
@@ -2292,10 +2319,12 @@ async def scan_ticker(client, ticker, market_open):
                 prev_close = float(_prev_rth['Close'].iloc[-1])
                 if prev_close > 0 and pd.notna(pm_close) and pd.notna(prev_close):
                     pm_gap_pct = round((pm_close - prev_close) / prev_close * 100, 3)
+                pm_high = round(float(_pm_bars['High'].max()), 2)
+                pm_low  = round(float(_pm_bars['Low'].min()),  2)
     except Exception:
         pass
 
-    result    = compute_signals(df_1m, df_5m, ticker=ticker)
+    result    = compute_signals(df_1m, df_5m, ticker=ticker, pm_high=pm_high, pm_low=pm_low)
     price     = result['price']
     bull_score= result['bull_score']
     bear_score= result['bear_score']
@@ -2383,6 +2412,10 @@ async def scan_ticker(client, ticker, market_open):
         "vp_profile": result['vp_profile'],
         "vwap_1u": result['vwap_1u'], "vwap_1d": result['vwap_1d'],
         "vwap_2u": result['vwap_2u'], "vwap_2d": result['vwap_2d'],
+        # Phase 18
+        "ema50_1m": result.get('ema50_1m'),
+        "pm_high":  result.get('pm_high'),
+        "pm_low":   result.get('pm_low'),
         # Phase 17
         "ema9_1m":      result.get('ema9_1m'),
         "range_vs_atr": result.get('range_vs_atr'),
@@ -3155,6 +3188,24 @@ function renderContextRow() {
     const eCls = aboveEma ? 'ctx-bull' : 'ctx-bear';
     html += `<span class="ctx-badge ${eCls}" title="EMA9 on 1-minute chart — reactive short-term trend filter">EMA9 $${d.ema9_1m.toFixed(2)} ${aboveEma ? '▲' : '▼'}</span>`;
   }
+  if (d.ema50_1m != null && d.price != null) {
+    const above50 = d.price > d.ema50_1m;
+    const e50Cls  = above50 ? 'ctx-bull' : 'ctx-bear';
+    html += `<span class="ctx-badge ${e50Cls}" title="EMA50 on 1-minute chart — 50-minute session trend. With EMA9+SMA20 forms a full trend stack.">EMA50 $${d.ema50_1m.toFixed(2)} ${above50 ? '▲' : '▼'}</span>`;
+  }
+  // Phase 18: PM High/Low badges
+  if (d.pm_high != null && d.price != null) {
+    const abovePM = d.price > d.pm_high;
+    const pmHCls  = abovePM ? 'ctx-bull' : 'ctx-neutral';
+    const pmHDist = ((d.price - d.pm_high) / d.price * 100).toFixed(2);
+    html += `<span class="ctx-badge ${pmHCls}" title="Pre-market session high — acts as resistance until broken; breakout is bullish">PM H $${d.pm_high.toFixed(2)} ${abovePM ? '▲ Above' : `(${pmHDist}%)`}</span>`;
+  }
+  if (d.pm_low != null && d.price != null) {
+    const belowPM = d.price < d.pm_low;
+    const pmLCls  = belowPM ? 'ctx-bear' : 'ctx-neutral';
+    const pmLDist = ((d.price - d.pm_low) / d.price * 100).toFixed(2);
+    html += `<span class="ctx-badge ${pmLCls}" title="Pre-market session low — acts as support until broken; breakdown is bearish">PM L $${d.pm_low.toFixed(2)} ${belowPM ? '▼ Below' : `(+${pmLDist}%)`}</span>`;
+  }
 
   // Phase 16: Gamma walls (call wall = nearest high-OI call above price; put wall = nearest high-OI put below price)
   if (d.top_call_strikes && d.top_call_strikes.length && d.price != null) {
@@ -3594,6 +3645,8 @@ function renderAnalytics() {
         ${lvlRow('Prev Close', kd.prev_close, '#666', false)}
         ${lvlRow('Prev Low',   kd.prev_low,   '#aaa', false)}
         ${kd.max_pain != null ? lvlRow('Max Pain', kd.max_pain, '#ffd700', true) : ''}
+        ${kd.pm_high != null ? lvlRow('PM High', kd.pm_high, '#66bbff', kd.price != null && kd.price > kd.pm_high) : ''}
+        ${kd.pm_low  != null ? lvlRow('PM Low',  kd.pm_low,  '#ff88aa', kd.price != null && kd.price < kd.pm_low)  : ''}
         ${kd.orb_high != null ? lvlRow('ORB High', kd.orb_high, '#00ffcc', false) : ''}
         ${kd.orb_low  != null ? lvlRow('ORB Low',  kd.orb_low,  '#ff9900', false) : ''}
         ${kd.price != null ? `<tr style="border-top:1px solid #222;background:#0d0d0d">
