@@ -24,6 +24,7 @@ from alpaca.trading.client import TradingClient
 from alpaca.trading.requests import (
     MarketOrderRequest, TakeProfitRequest, StopLossRequest, GetOrdersRequest
 )
+from alpaca.trading.enums import QueryOrderStatus
 from alpaca.trading.enums import OrderSide, TimeInForce, OrderClass
 
 # ====================== CONFIG ======================
@@ -1171,6 +1172,7 @@ def send_notifications(ticker, price, bull_score, bear_score, direction,
 
 
 # ====================== ALPACA EXECUTION ======================
+# Pipeline: [1] CQ Gate  →  [2] Conflict Guard  →  [3] Dynamic Sizing  →  [4] OCA Bracket
 
 _alpaca_client: TradingClient | None = None
 
@@ -1186,31 +1188,35 @@ def _get_alpaca() -> TradingClient | None:
     return _alpaca_client
 
 
-def _alpaca_has_conflict(client, ticker, direction):
-    """
-    Returns True if Alpaca already has an open position or pending order
-    on this ticker in the same direction. Prevents double-entry on restart
-    or rapid re-trigger — this is the Alpaca-side guard; the in-memory
-    open_trades dict is the fast path that runs first.
-    """
-    want_long = direction == "BULL"
+# ── [1] CQ Gate ──────────────────────────────────────────────────────────────
+def _passes_cq_gate(cq: str) -> bool:
+    """Allow execution only when signal CQ meets or exceeds ALPACA_CQ_MIN (default MED)."""
+    return _CQ_RANK.get(cq, 0) >= _CQ_RANK.get(ALPACA_CQ_MIN, 0)
 
-    # 1. Check open positions
+
+# ── [2] Conflict Guard ───────────────────────────────────────────────────────
+def _alpaca_has_conflict(client: TradingClient, ticker: str, direction: str) -> bool:
+    """
+    Query Alpaca's live state — not our in-memory cache — for a same-direction
+    position or pending order on this ticker. Survives process restarts where
+    open_trades is reset. The in-memory guard in send_notifications() runs first
+    as the fast path; this is the authoritative Alpaca-side check.
+    """
+    want_long = (direction == "BULL")
+
     try:
         pos = client.get_open_position(ticker)
-        # pos exists — check direction
-        already_long = pos.side.value == "long"
+        already_long = (pos.side.value == "long")
         if already_long == want_long:
-            print(f"[ALPACA] Conflict: {ticker} already has {'long' if already_long else 'short'} position", flush=True)
+            print(f"[ALPACA] Guard: {ticker} already {'long' if already_long else 'short'} — skip", flush=True)
             return True
     except Exception:
-        pass  # no position — ok
+        pass  # NoPositionFound is expected when no position exists
 
-    # 2. Check pending/open orders on this symbol
     try:
-        pending = client.get_orders(GetOrdersRequest(symbols=[ticker]))
-        if pending:
-            print(f"[ALPACA] Conflict: {ticker} has {len(pending)} open order(s)", flush=True)
+        open_orders = client.get_orders(GetOrdersRequest(symbols=[ticker]))
+        if open_orders:
+            print(f"[ALPACA] Guard: {ticker} has {len(open_orders)} pending order(s) — skip", flush=True)
             return True
     except Exception:
         pass
@@ -1218,61 +1224,89 @@ def _alpaca_has_conflict(client, ticker, direction):
     return False
 
 
-def _score_scaled_qty(price, score):
+# ── [3] Dynamic Sizing ───────────────────────────────────────────────────────
+def _calc_order_qty(price: float, score: int) -> float:
     """
-    Scale position size by conviction score:
-      score at alert floor (22%) → 0.72× base USD
-      score at 50%             → 1.00× base USD
-      score at 80%+            → 1.30× base USD
-      cap at 1.5× (score=100%)
-    Returns integer share count, minimum 1.
+    Target allocation = TRADE_SIZE_USD × (score / MAX_SCORE)
+
+    Score IS the allocation percentage — pure linear:
+      score=22  → $500 × 0.22 = $110  →  $110 / price
+      score=45  → $500 × 0.45 = $225  →  $225 / price  (e.g. QQQ ~0.30sh)
+      score=70  → $500 × 0.70 = $350  →  $350 / price
+      score=100 → $500 × 1.00 = $500  →  $500 / price
+
+    Returns fractional qty rounded to 2 dp (Alpaca supports fractions for
+    SPY/QQQ/IWM/NVDA/AAPL), minimum 0.01 shares.
     """
-    score_ratio  = min(score / MAX_SCORE, 1.0)
-    effective_usd = TRADE_SIZE_USD * (0.5 + score_ratio)
-    return max(1, int(effective_usd / price))
+    target_usd = round(TRADE_SIZE_USD * (score / MAX_SCORE), 2)
+    qty        = round(target_usd / price, 2)
+    return max(0.01, qty)
 
 
-def submit_alpaca_order(ticker, direction, price, stop, tp, score, cq):
-    """Submit a bracket order to Alpaca (market entry + OCA stop/TP)."""
+# ── [4] OCA Bracket Submission ───────────────────────────────────────────────
+def submit_alpaca_order(ticker: str, direction: str, price: float,
+                        stop: float, tp: float, score: int, cq: str):
+    """
+    Full execution pipeline:  CQ Gate → Conflict Guard → Sizing → OCA Bracket
+
+    Bracket structure (One-Cancels-All):
+      Entry leg  : MarketOrderRequest  — fills at prevailing market price
+      SL leg     : StopLossRequest     — stop_price  = entry ∓ (ATR_STOP_MULT × ATR)
+      TP leg     : TakeProfitRequest   — limit_price = entry ± (ATR_TP_MULT  × ATR)
+
+    stop/tp are pre-computed by compute_signals() using the live ATR value and
+    passed through scan_ticker() → send_notifications() → here.
+    """
     if not ALPACA_ENABLED:
         return None
-    if _CQ_RANK.get(cq, 0) < _CQ_RANK.get(ALPACA_CQ_MIN, 0):
-        print(f"[ALPACA] Skipped {ticker} — CQ={cq} below min={ALPACA_CQ_MIN}", flush=True)
+
+    # [1] CQ Gate
+    if not _passes_cq_gate(cq):
+        print(f"[ALPACA] Gate: {ticker} CQ={cq} < min={ALPACA_CQ_MIN} — skip", flush=True)
         return None
 
     client = _get_alpaca()
     if not client:
         return None
 
-    # Alpaca-side double-entry guardrail (survives process restarts)
+    # [2] Conflict Guard (Alpaca live state check)
     if _alpaca_has_conflict(client, ticker, direction):
         return None
 
-    try:
-        shares = _score_scaled_qty(price, score)
-        side   = OrderSide.BUY if direction == "BULL" else OrderSide.SELL
+    # [3] Dynamic Sizing  →  target_usd = $500 × (score / 100)
+    qty        = _calc_order_qty(price, score)
+    target_usd = round(TRADE_SIZE_USD * (score / MAX_SCORE), 2)
+    side       = OrderSide.BUY if direction == "BULL" else OrderSide.SELL
 
+    # [4] Build OCA bracket and submit
+    try:
         req = MarketOrderRequest(
             symbol=ticker,
-            qty=shares,
+            qty=qty,
             side=side,
             time_in_force=TimeInForce.DAY,
             order_class=OrderClass.BRACKET,
-            take_profit=TakeProfitRequest(limit_price=round(tp, 2)),
-            stop_loss=StopLossRequest(stop_price=round(stop, 2)),
+            take_profit=TakeProfitRequest(limit_price=round(tp,   2)),
+            stop_loss=StopLossRequest(    stop_price=round(stop, 2)),
         )
-        order = client.submit_order(req)
-        effective_usd = shares * price
-        env = "PAPER" if ALPACA_PAPER else "LIVE"
+        order    = client.submit_order(req)
+        notional = round(qty * price, 2)
+        env      = "PAPER" if ALPACA_PAPER else "LIVE"
+        sl_pct   = abs(price - stop) / price * 100
+        tp_pct   = abs(tp   - price) / price * 100
         print(
-            f"[ALPACA:{env}] ORDER {order.id} | {ticker} {direction} "
-            f"{shares}sh (~${effective_usd:.0f}) | SL${stop:.2f} TP${tp:.2f} "
-            f"| score={score}/{MAX_SCORE} ({score/MAX_SCORE*100:.0f}%) CQ={cq}",
+            f"[ALPACA:{env}] BRACKET SUBMITTED\n"
+            f"  ID      : {order.id}\n"
+            f"  Ticker  : {ticker}  {direction}  qty={qty}sh  "
+            f"(target=${target_usd:.2f} / notional≈${notional:.2f})\n"
+            f"  Entry   : market  |  SL: ${stop:.2f} (-{sl_pct:.2f}%)  "
+            f"|  TP: ${tp:.2f} (+{tp_pct:.2f}%)\n"
+            f"  Score   : {score}/{MAX_SCORE} ({score/MAX_SCORE*100:.0f}%)  CQ: {cq}",
             flush=True
         )
         return str(order.id)
     except Exception as e:
-        print(f"[ALPACA] Order failed {ticker} {direction}: {e}", flush=True)
+        print(f"[ALPACA] Order failed [{ticker} {direction}]: {e}", flush=True)
         return None
 
 
@@ -1497,7 +1531,10 @@ def api_alpaca():
     try:
         account   = client.get_account()
         positions = client.get_all_positions()
-        orders    = client.get_orders()
+        orders    = client.get_orders(GetOrdersRequest(
+            status=QueryOrderStatus.ALL,   # open + filled + canceled
+            limit=25,
+        ))
         return jsonify({
             "enabled": True,
             "paper":   ALPACA_PAPER,
