@@ -81,6 +81,29 @@ FIB_ZONE_ATR          = 0.5     # price within 0.5×ATR of fib level = "at zone"
 RS_LEADER_THRESH      = 0.15    # ticker outperforming SPY by ≥0.15% = RS leader
 RS_LAGGER_THRESH      = -0.15   # ticker underperforming SPY by ≥0.15% = RS lagger
 
+# ── Phase 13: Signal category mapping ───────────────────────────────────────
+SIGNAL_CATEGORIES = {
+    # TECH — core momentum and trend indicators
+    "sma20":"TECH",    "adx":"TECH",     "rsi":"TECH",   "ftfc":"TECH",
+    "supertrend":"TECH","heikin_ashi":"TECH","vwap":"TECH","bb":"TECH",
+    "macd":"TECH",     "rsi_div":"TECH",
+    # PATTERN — price action and candle structure
+    "fvg":"PATTERN",   "ob":"PATTERN",   "gap":"PATTERN","orb":"PATTERN",
+    "candle_bull":"PATTERN","candle_bear":"PATTERN",
+    # LEVELS — key price levels and structural zones
+    "pivot_bull":"LEVELS","pivot_bear":"LEVELS",
+    "pdh_break":"LEVELS", "pdl_break":"LEVELS",
+    "fib_support":"LEVELS","fib_resist":"LEVELS","fib_ext":"LEVELS",
+    "vpoc_bull":"LEVELS","vpoc_bear":"LEVELS",
+    "above_vah":"LEVELS","below_val":"LEVELS",
+    # INST — institutional and smart-money flow
+    "block_print":"INST","flow_unusual":"INST","vol_delta":"INST",
+    "vwap_def":"INST",  "tape_read":"INST",
+    # MARKET — macro context, regime, and breadth
+    "vix":"MARKET",    "pcr":"MARKET",   "trend_15m":"MARKET",
+    "trend_1h":"MARKET","regime_bull":"MARKET","regime_bear":"MARKET",
+}
+
 print("=== SPX CONFLUENCE SCANNER STARTING ===", flush=True)
 
 # ====================== HELPERS ======================
@@ -1150,6 +1173,9 @@ _blank_ticker = lambda t: {
     # Phase 12
     "vpoc": None, "vah": None, "val": None, "vp_profile": [],
     "vwap_1u": None, "vwap_1d": None, "vwap_2u": None, "vwap_2d": None,
+    # Phase 13
+    "bull_breakdown": {}, "bear_breakdown": {},
+    "bull_cq": "WEAK",   "bear_cq": "WEAK",
     "bull_signals": {},
     "bear_signals": {},
     "history":      load_history(t),
@@ -1807,6 +1833,33 @@ def compute_signals(df_1m, df_5m, ticker=None):
     }
     bear_score = sum(s['points'] for s in bear.values() if s['active'])
 
+    # ── Phase 13: Per-category confluence breakdown ───────────────────────────
+    def _cat_breakdown(signals):
+        cats = {"TECH": 0, "PATTERN": 0, "LEVELS": 0, "INST": 0, "MARKET": 0}
+        pts  = {k: 0 for k in cats}
+        tot  = {k: 0 for k in cats}
+        for key, sig in signals.items():
+            cat = SIGNAL_CATEGORIES.get(key, "TECH")
+            tot[cat]  += sig["points"]
+            if sig["active"]:
+                cats[cat] += 1
+                pts[cat]  += sig["points"]
+        n_cats       = sum(1 for v in cats.values() if v > 0)
+        tech_strong  = cats.get("TECH", 0) >= 3
+        inst_present = cats.get("INST", 0) >= 1
+        if n_cats >= 4 and tech_strong and inst_present:
+            cq = "HIGH"
+        elif n_cats >= 3 and tech_strong:
+            cq = "MED"
+        elif n_cats >= 2:
+            cq = "LOW"
+        else:
+            cq = "WEAK"
+        return {"active": cats, "pts": pts, "total": tot, "n_cats": n_cats, "cq": cq}
+
+    bull_breakdown = _cat_breakdown(bull)
+    bear_breakdown = _cat_breakdown(bear)
+
     if bull_score > bear_score:
         direction = "BULL"
     elif bear_score > bull_score:
@@ -1866,6 +1919,11 @@ def compute_signals(df_1m, df_5m, ticker=None):
         "vpoc": vpoc, "vah": vah, "val": val, "vp_profile": vp_profile,
         "vwap_1u": vwap_1u, "vwap_1d": vwap_1d,
         "vwap_2u": vwap_2u, "vwap_2d": vwap_2d,
+        # Phase 13: confluence quality breakdown
+        "bull_breakdown": bull_breakdown,
+        "bear_breakdown": bear_breakdown,
+        "bull_cq":        bull_breakdown["cq"],
+        "bear_cq":        bear_breakdown["cq"],
     }
 
 
@@ -2161,6 +2219,11 @@ async def scan_ticker(client, ticker, market_open):
         "vp_profile": result['vp_profile'],
         "vwap_1u": result['vwap_1u'], "vwap_1d": result['vwap_1d'],
         "vwap_2u": result['vwap_2u'], "vwap_2d": result['vwap_2d'],
+        # Phase 13
+        "bull_breakdown": result.get('bull_breakdown', {}),
+        "bear_breakdown": result.get('bear_breakdown', {}),
+        "bull_cq":        result.get('bull_cq', 'WEAK'),
+        "bear_cq":        result.get('bear_cq', 'WEAK'),
         # PCR from options_data (updated by fetch_options_flow, not per-scan)
         "pcr":          options_data.get(ticker, {}).get("pcr"),
         "pcr_oi":       options_data.get(ticker, {}).get("pcr_oi"),
@@ -2418,6 +2481,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 
     <!-- Signal Grid (hidden when analytics tab active) -->
     <div id="signals-section">
+      <div id="cat-breakdown"></div>
       <div id="div-warn-banner" class="d-none"></div>
       <div class="row g-2 mb-3" id="signal-grid"></div>
       <!-- ATR Risk Panel -->
@@ -2504,6 +2568,7 @@ const MAX_SCORE           = """ + str(MAX_SCORE) + """;
 const ALERT_SCORE_THRESH  = """ + str(ALERT_SCORE_THRESHOLD) + """;
 const LOG_SCORE_THRESH    = """ + str(LOG_SCORE_THRESHOLD) + """;
 const FIB_LOOKBACK        = """ + str(200) + """;
+const SIGNAL_CATEGORIES   = """ + json.dumps(SIGNAL_CATEGORIES) + """;
 
 const TV_SYMBOLS = {
   SPY:'AMEX:SPY', QQQ:'NASDAQ:QQQ', IWM:'AMEX:IWM',
@@ -2822,12 +2887,49 @@ function renderContextRow() {
 // ── Signal grid ───────────────────────────────────────────────────────────────
 const INST_KEYS = new Set(['block_print','flow_unusual','vol_delta','vwap_def','tape_read']);
 
+const CAT_COLORS  = {TECH:'#2266cc',PATTERN:'#cc7700',LEVELS:'#8833cc',INST:'#cc9900',MARKET:'#008855'};
+const CAT_LABELS  = {TECH:'Technical',PATTERN:'Pattern',LEVELS:'Levels',INST:'Institutional',MARKET:'Market'};
+const CAT_ORDER   = ['TECH','PATTERN','LEVELS','INST','MARKET'];
+const CQ_META     = {
+  HIGH: {clr:'#00ff88', lbl:'★ CQ HIGH'},
+  MED:  {clr:'#ffcc00', lbl:'◆ CQ MED'},
+  LOW:  {clr:'#ff9944', lbl:'▲ CQ LOW'},
+  WEAK: {clr:'#555555', lbl:'CQ WEAK'},
+};
+
+function renderCatBreakdown(breakdown, cq) {
+  const el = document.getElementById('cat-breakdown');
+  if (!el) return;
+  if (!breakdown || !breakdown.active) { el.innerHTML = ''; return; }
+  const m = CQ_META[cq] || CQ_META.WEAK;
+  const bars = CAT_ORDER.map(cat => {
+    const active = (breakdown.active || {})[cat] || 0;
+    const total  = (breakdown.total  || {})[cat] || 0;
+    if (!total) return '';
+    const pct = Math.round(active / total * 100);
+    const clr = active > 0 ? CAT_COLORS[cat] : '#1e1e1e';
+    return `<span style="display:inline-flex;align-items:center;gap:3px;font-size:.6rem">
+      <span style="color:${clr};font-weight:bold;min-width:26px">${cat.slice(0,3)}</span>
+      <span style="display:inline-block;width:36px;height:4px;background:#1a1a1a;border-radius:2px;overflow:hidden"><span style="display:inline-block;width:${pct}%;height:4px;background:${clr}"></span></span>
+      <span style="color:${clr};min-width:22px">${active}/${total}</span>
+    </span>`;
+  }).filter(Boolean).join('<span style="color:#2a2a2a;margin:0 3px">|</span>');
+  el.innerHTML = `<div style="display:flex;align-items:center;flex-wrap:wrap;gap:4px;padding:3px 0 5px;border-bottom:1px solid #181818;margin-bottom:5px">
+    ${bars}
+    <span style="margin-left:auto;font-size:.6rem;font-weight:bold;color:${m.clr};border:1px solid ${m.clr}55;padding:1px 6px;border-radius:3px;white-space:nowrap">${m.lbl}</span>
+  </div>`;
+}
+
 function renderSignals() {
   const d = allData[curTicker];
   if (!d) return;
-  const signals = curDir === 'bull' ? d.bull_signals : d.bear_signals;
-  const grid = document.getElementById('signal-grid');
-  grid.innerHTML = '';
+  const signals   = curDir === 'bull' ? d.bull_signals   : d.bear_signals;
+  const breakdown = curDir === 'bull' ? d.bull_breakdown : d.bear_breakdown;
+  const cq        = curDir === 'bull' ? d.bull_cq        : d.bear_cq;
+  const grid      = document.getElementById('signal-grid');
+  grid.innerHTML  = '';
+
+  renderCatBreakdown(breakdown, cq);
 
   // Volume-delta divergence warning banner
   const divEl = document.getElementById('div-warn-banner');
@@ -2842,27 +2944,39 @@ function renderSignals() {
     divEl.classList.add('d-none');
   }
 
-  for (const [key, sig] of Object.entries(signals || {})) {
-    const col = document.createElement('div');
-    col.className = 'col-6 col-md-4 col-xl-3';
-    const isInst = INST_KEYS.has(key);
-    const tfHtml = sig.tf1 !== undefined
-      ? `<span class="tf-badge ${sig.tf1?'tf-ok':'tf-no'}">1m</span><span class="tf-badge ${sig.tf5?'tf-ok':'tf-no'}">5m</span>`
-      : '';
-    const color = sig.active ? (curDir==='bull'?'#00ff88':'#ff6666') : (isInst ? '#5a4a00' : '#444');
-    col.innerHTML = `<div class="sig-card ${isInst?'inst ':''} ${sig.active?'active':'inactive'}">
-      <span class="sig-icon">${sig.active?(curDir==='bull'?'✅':'🔴'):'❌'}</span>
-      <div class="sig-label">${sig.label} ${tfHtml} <small style="color:#444">${sig.points}pt</small></div>
-      <div class="sig-val" style="color:${color}">${sig.value}</div>
-    </div>`;
-    grid.appendChild(col);
+  // Render signals grouped by category
+  for (const cat of CAT_ORDER) {
+    const catSigs = Object.entries(signals || {}).filter(([k]) => (SIGNAL_CATEGORIES[k] || 'TECH') === cat);
+    if (!catSigs.length) continue;
+    const clr = CAT_COLORS[cat];
+
+    const hdr = document.createElement('div');
+    hdr.className = 'col-12';
+    hdr.innerHTML = `<div style="font-size:.55rem;text-transform:uppercase;letter-spacing:1.5px;color:${clr};border-bottom:1px solid ${clr}33;padding-bottom:2px;margin-top:5px;margin-bottom:2px">${CAT_LABELS[cat]}</div>`;
+    grid.appendChild(hdr);
+
+    for (const [key, sig] of catSigs) {
+      const col    = document.createElement('div');
+      col.className = 'col-6 col-md-4 col-xl-3';
+      const isInst = INST_KEYS.has(key);
+      const tfHtml = sig.tf1 !== undefined
+        ? `<span class="tf-badge ${sig.tf1?'tf-ok':'tf-no'}">1m</span><span class="tf-badge ${sig.tf5?'tf-ok':'tf-no'}">5m</span>`
+        : '';
+      const valColor    = sig.active ? (curDir==='bull'?'#00ff88':'#ff6666') : (isInst ? '#5a4a00' : '#444');
+      const borderColor = sig.active ? clr+'cc' : clr+'22';
+      col.innerHTML = `<div class="sig-card ${isInst?'inst ':''} ${sig.active?'active':'inactive'}" style="border-left:2px solid ${borderColor}">
+        <span class="sig-icon">${sig.active?(curDir==='bull'?'✅':'🔴'):'❌'}</span>
+        <div class="sig-label">${sig.label} ${tfHtml} <small style="color:#444">${sig.points}pt</small></div>
+        <div class="sig-val" style="color:${valColor}">${sig.value}</div>
+      </div>`;
+      grid.appendChild(col);
+    }
   }
 
   const vsBadge = document.getElementById('vol-spike-badge');
-  const d2 = allData[curTicker];
-  if (d2 && d2.volume_spike) {
+  if (d.volume_spike) {
     vsBadge.classList.remove('d-none');
-    vsBadge.textContent = '⚡ VOL SPIKE ' + (d2.vol_ratio ? d2.vol_ratio+'x' : '');
+    vsBadge.textContent = '⚡ VOL SPIKE ' + (d.vol_ratio ? d.vol_ratio+'x' : '');
   } else {
     vsBadge.classList.add('d-none');
   }
