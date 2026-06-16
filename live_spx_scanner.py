@@ -2590,6 +2590,8 @@ async def scan_ticker(client, ticker, market_open):
         "history":      history,
     })
 
+    cq_now = result.get('bull_cq' if direction != 'BEAR' else 'bear_cq', 'WEAK')
+
     # JSON signal log
     if score >= LOG_SCORE_THRESHOLD:
         global signal_log
@@ -2615,9 +2617,8 @@ async def scan_ticker(client, ticker, market_open):
 
     # External alerts
     if market_open and score >= ALERT_SCORE_THRESHOLD:
-        stop   = result['bull_stop'] if direction != "BEAR" else result['bear_stop']
-        tp     = result['bull_tp']   if direction != "BEAR" else result['bear_tp']
-        cq_now = result.get('bull_cq' if direction != 'BEAR' else 'bear_cq', 'WEAK')
+        stop = result['bull_stop'] if direction != "BEAR" else result['bear_stop']
+        tp   = result['bull_tp']   if direction != "BEAR" else result['bear_tp']
         send_notifications(ticker, price, bull_score, bear_score, direction,
                            vol_spike, result['atr'], stop, tp, cq=cq_now)
 
@@ -3025,14 +3026,18 @@ function setupGrade(d, dir) {
   const score = dir === 'bear' ? d.bear_score : d.bull_score;
   const cq    = dir === 'bear' ? d.bear_cq    : d.bull_cq;
   const vel   = dir === 'bear' ? d.bear_velocity : d.bull_velocity;
-  const pct   = score / MAX_SCORE;
+  const pct    = score / MAX_SCORE;
   const rising = vel === null || vel >= 0;
-  if (cq === 'HIGH' && pct >= 0.60 && rising) return {g:'A',  c:'#00ff88'};
-  if (cq === 'HIGH' && pct >= 0.50)           return {g:'A−', c:'#44ee88'};
-  if (cq === 'MED'  && pct >= 0.46 && rising) return {g:'B',  c:'#00ffcc'};
-  if (cq === 'MED'  && pct >= 0.34)           return {g:'B−', c:'#44ccaa'};
-  if (cq === 'LOW'  && pct >= 0.30)           return {g:'C',  c:'#ffcc00'};
-  if (pct >= 0.20)                             return {g:'D',  c:'#ff9944'};
+  const cqRank = {HIGH:3, MED:2, LOW:1, WEAK:0}[cq] || 0;
+  // A: exceptional — HIGH quality + strong weighted score (≥58% = 58+/100)
+  if (cqRank >= 3 && pct >= 0.58 && rising) return {g:'A',  c:'#00ff88'};
+  if (cqRank >= 3 && pct >= 0.44)           return {g:'A−', c:'#44ee88'};
+  // B: solid — HIGH quality + moderate score, or MED quality + strong score
+  if (cqRank >= 2 && pct >= 0.36 && rising) return {g:'B',  c:'#00ffcc'};
+  if (cqRank >= 2 && pct >= 0.26)           return {g:'B−', c:'#44ccaa'};
+  // C: developing
+  if (cqRank >= 1 && pct >= 0.20)           return {g:'C',  c:'#ffcc00'};
+  if (pct >= 0.14)                           return {g:'D',  c:'#ff9944'};
   return {g:'F', c:'#444'};
 }
 
@@ -3889,11 +3894,13 @@ function renderAnalytics() {
   for (const e of src) byTicker[e.ticker] = (byTicker[e.ticker] || 0) + 1;
   const maxTkCnt = Math.max(...Object.values(byTicker), 1);
 
+  const DIST_BUCKET = 10;
   const scoreDist = {};
-  for (let i = LOG_SCORE_THRESH; i <= MAX_SCORE; i++) scoreDist[i] = 0;
+  for (let b = 0; b <= 90; b += DIST_BUCKET) scoreDist[b] = 0;
   for (const e of src) {
     const s = Math.max(e.bull_score || 0, e.bear_score || 0);
-    if (s >= LOG_SCORE_THRESH) scoreDist[s] = (scoreDist[s] || 0) + 1;
+    const bucket = Math.min(90, Math.floor(s / DIST_BUCKET) * DIST_BUCKET);
+    scoreDist[bucket] = (scoreDist[bucket] || 0) + 1;
   }
   const maxScoreCnt = Math.max(...Object.values(scoreDist), 1);
 
@@ -4036,9 +4043,10 @@ function renderAnalytics() {
     <div class="section-title">Score Distribution</div>
     ${Object.entries(scoreDist).map(([s, n]) => {
       const si = parseInt(s);
-      const color = si >= 13 ? '#00ff88' : si >= 10 ? '#aaff00' : si >= ALERT_SCORE_THRESH ? '#ffaa00' : '#ff6666';
+      const color = si >= 50 ? '#00ff88' : si >= 30 ? '#aaff00' : si >= ALERT_SCORE_THRESH ? '#ffaa00' : '#ff6666';
+      const label = `${si}–${si+10}`;
       return `<div class="d-flex align-items-center gap-2 mb-1" style="font-size:.76rem">
-        <span style="width:18px;color:#555;text-align:right">${s}</span>
+        <span style="width:42px;color:#aaa;text-align:right">${label}</span>
         ${miniBar(n/maxScoreCnt*100, color)}
         <span style="width:18px;color:#555;text-align:right">${n}</span>
       </div>`;
