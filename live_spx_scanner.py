@@ -36,11 +36,18 @@ WATCHLIST             = ["SPY", "QQQ", "IWM", "NVDA", "AAPL"]
 SIGNAL_LOG_FILE       = "/tmp/signal_log.json"
 CSV_LOG_FILE          = "/tmp/signals.csv"
 HISTORY_FILE_TMPL     = "/tmp/score_history_{}.json"
-MAX_SCORE             = 33       # 20 + 5 inst + 2 pivot + 2 candle/regime + 2 fib + 2 volume-profile signals per direction
+MAX_SCORE             = 35       # 20 + 5 inst + 2 pivot + 2 candle/regime + 2 fib + 2 volume-profile + 2 stochrsi
 ALERT_COOLDOWN_SECS   = 900
 VOLUME_SPIKE_MULT     = 3.0
 ALERT_SCORE_THRESHOLD = 9
 LOG_SCORE_THRESHOLD   = 6
+# Phase 14: CQ-gated alert routing
+# HIGH → Discord + Telegram + Email (starred message)
+# MED  → Discord + Telegram
+# LOW  → Discord only
+# WEAK → suppressed (score threshold still required)
+CQ_MIN_ALERT          = os.getenv("CQ_MIN_ALERT", "LOW")   # set to MED or HIGH to reduce noise
+_CQ_RANK              = {"WEAK": 0, "LOW": 1, "MED": 2, "HIGH": 3}
 ATR_STOP_MULT         = 1.5      # stop loss = price ± 1.5×ATR
 ATR_TP_MULT           = 2.5      # take profit = price ± 2.5×ATR
 ACCOUNT_SIZE          = float(os.getenv("ACCOUNT_SIZE", "25000"))
@@ -86,7 +93,7 @@ SIGNAL_CATEGORIES = {
     # TECH — core momentum and trend indicators
     "sma20":"TECH",    "adx":"TECH",     "rsi":"TECH",   "ftfc":"TECH",
     "supertrend":"TECH","heikin_ashi":"TECH","vwap":"TECH","bb":"TECH",
-    "macd":"TECH",     "rsi_div":"TECH",
+    "macd":"TECH",     "rsi_div":"TECH", "stochrsi":"TECH",
     # PATTERN — price action and candle structure
     "fvg":"PATTERN",   "ob":"PATTERN",   "gap":"PATTERN","orb":"PATTERN",
     "candle_bull":"PATTERN","candle_bear":"PATTERN",
@@ -1066,7 +1073,7 @@ def _send_email(subject, body):
 
 
 def send_notifications(ticker, price, bull_score, bear_score, direction,
-                       volume_spike=False, atr=None, stop=None, tp=None):
+                       volume_spike=False, atr=None, stop=None, tp=None, cq="WEAK"):
     global _last_alert_times
     now  = datetime.now()
     last = _last_alert_times.get(ticker)
@@ -1075,26 +1082,34 @@ def send_notifications(ticker, price, bull_score, bear_score, direction,
         print(f"Alert suppressed [{ticker}] — cooldown {remaining}s", flush=True)
         return
 
-    score = bull_score if direction == "BULL" else bear_score
-    arrow = "🔥" if direction == "BULL" else "🔻"
-    vol   = " ⚡ VOLUME SPIKE" if volume_spike else ""
+    # Phase 14: CQ gate — suppress if below minimum tier
+    if _CQ_RANK.get(cq, 0) < _CQ_RANK.get(CQ_MIN_ALERT, 0):
+        print(f"Alert suppressed [{ticker}] — CQ={cq} below min={CQ_MIN_ALERT}", flush=True)
+        return
+
+    score  = bull_score if direction == "BULL" else bear_score
+    arrow  = "🔥" if direction == "BULL" else "🔻"
+    vol    = " ⚡ VOLUME SPIKE" if volume_spike else ""
     levels = ""
     if atr and stop and tp:
         levels = f"\nATR: {atr:.2f} | SL: ${stop:.2f} | TP: ${tp:.2f}"
 
+    cq_tag = {"HIGH": "★ HIGH CONF | ", "MED": "◆ MED CONF | ", "LOW": ""}.get(cq, "")
     msg = (
         f"{arrow} *{ticker} {direction} Confluence Alert*{vol}\n"
-        f"Price: ${price:.2f} | Score: {score}/{MAX_SCORE}"
+        f"{cq_tag}Price: ${price:.2f} | Score: {score}/{MAX_SCORE}"
         f"{levels}\n"
         f"Time: {now.strftime('%H:%M:%S ET')}"
     )
 
+    # Route by CQ tier: HIGH → all channels; MED → Discord+Telegram; LOW → Discord only
     _send_discord(ticker, msg)
-    _send_telegram(msg)
-    _send_email(
-        subject=f"[Scanner] {ticker} {direction} — {score}/{MAX_SCORE}{vol}",
-        body=msg.replace("*", "").replace("🔥", "").replace("🔻", "").replace("⚡", "")
-    )
+    if cq in ("HIGH", "MED"):
+        _send_telegram(msg)
+        _send_email(
+            subject=f"[Scanner] {cq_tag}{ticker} {direction} — {score}/{MAX_SCORE}{vol}",
+            body=msg.replace("*", "").replace("🔥", "").replace("🔻", "").replace("⚡", "")
+        )
 
     _last_alert_times[ticker] = now
     if stop and tp:
@@ -1105,7 +1120,8 @@ def send_notifications(ticker, price, bull_score, bear_score, direction,
         "price":     round(float(price), 2),
         "score":     score,
         "direction": direction,
-        "message":   f"{direction} confluence{vol}",
+        "cq":        cq,
+        "message":   f"{cq_tag}{direction} confluence{vol}",
     })
     dashboard_data[ticker]["alerts"] = dashboard_data[ticker]["alerts"][:10]
 
@@ -1173,6 +1189,8 @@ _blank_ticker = lambda t: {
     # Phase 12
     "vpoc": None, "vah": None, "val": None, "vp_profile": [],
     "vwap_1u": None, "vwap_1d": None, "vwap_2u": None, "vwap_2d": None,
+    # Phase 14
+    "stochrsi_k": None, "stochrsi_d": None,
     # Phase 13
     "bull_breakdown": {}, "bear_breakdown": {},
     "bull_cq": "WEAK",   "bear_cq": "WEAK",
@@ -1474,6 +1492,21 @@ def compute_signals(df_1m, df_5m, ticker=None):
     except Exception:
         pass
 
+    # ── Phase 14: Stochastic RSI ─────────────────────────────────────────────
+    stochrsi_k = stochrsi_d = stochrsi_k_prev = stochrsi_d_prev = None
+    try:
+        srsi = ta.stochrsi(df['Close'], length=14, rsi_length=14, k=3, d=3)
+        if srsi is not None and len(srsi) >= 2:
+            k_col = srsi.iloc[:, 0]
+            d_col = srsi.iloc[:, 1]
+            if _valid(k_col.iloc[-1]) and _valid(d_col.iloc[-1]):
+                stochrsi_k      = round(float(k_col.iloc[-1]),  1)
+                stochrsi_d      = round(float(d_col.iloc[-1]),  1)
+                stochrsi_k_prev = round(float(k_col.iloc[-2]),  1) if _valid(k_col.iloc[-2]) else None
+                stochrsi_d_prev = round(float(d_col.iloc[-2]),  1) if _valid(d_col.iloc[-2]) else None
+    except Exception:
+        pass
+
     # ── Time-of-day filter (9:30-9:44 and 15:55-16:00 are suppressed) ────────
     et_now  = datetime.now(timezone.utc).astimezone(_ET)
     in_open = et_now.hour == 9  and et_now.minute < 45     # first 15 min
@@ -1734,6 +1767,21 @@ def compute_signals(df_1m, df_5m, ticker=None):
         macd_prev is not None and signal_prev is not None and
         macd_val > signal_val and macd_prev <= signal_prev
     )
+    # StochRSI bull: K crossed above D from non-overbought territory
+    stochrsi_bull = bool(
+        stochrsi_k is not None and stochrsi_d is not None and
+        stochrsi_k_prev is not None and stochrsi_d_prev is not None and
+        stochrsi_k > stochrsi_d and stochrsi_k_prev <= stochrsi_d_prev and
+        stochrsi_k < 80
+    )
+    # StochRSI bear: K crossed below D from non-oversold territory
+    stochrsi_bear = bool(
+        stochrsi_k is not None and stochrsi_d is not None and
+        stochrsi_k_prev is not None and stochrsi_d_prev is not None and
+        stochrsi_k < stochrsi_d and stochrsi_k_prev >= stochrsi_d_prev and
+        stochrsi_k > 20
+    )
+    _srsi_val = f"K:{stochrsi_k} D:{stochrsi_d}" if stochrsi_k is not None else "--"
 
     bull = {
         "sma20":       bs("SMA20 MTF",      2, sma_b1 and sma_b5,      f"{sma20_1m:.2f}" if _valid(sma20_1m) else "--",  sma_b1, sma_b5),
@@ -1748,6 +1796,7 @@ def compute_signals(df_1m, df_5m, ticker=None):
         "rsi_div":     bs("RSI Div Bull",    1, rsi_div == 'bull',      rsi_div.capitalize() if rsi_div else "None"),
         "bb":          bs("BB Squeeze ↑",    1, bb_b,                   f">{bb_upper_val:.2f}" if bb_upper_val else "--"),
         "macd":        bs("MACD Cross ↑",    1, macd_b,                 f"{macd_val:.3f}" if macd_val is not None else "--"),
+        "stochrsi":    bs("StochRSI Cross ↑",1, stochrsi_bull,          _srsi_val),
         "orb":         bs("ORB Break ↑",     1, orb_dir == 'bull',      f">{orb_high:.2f}" if orb_high else "No ORB"),
         "gap":         bs("Gap Up",          1, gap_dir == 'bull',      f"+{gap_pct:.2f}%" if (gap_pct is not None and gap_pct > 0) else (f"{gap_pct:.2f}%" if gap_pct is not None else "--")),
         "vix":         bs("Breadth Bull",     1, vix_bull,               vix_label),
@@ -1806,6 +1855,7 @@ def compute_signals(df_1m, df_5m, ticker=None):
         "rsi_div":     bs("RSI Div Bear",     1, rsi_div == 'bear',     rsi_div.capitalize() if rsi_div else "None"),
         "bb":          bs("BB Squeeze ↓",     1, bb_r,                  f"<{bb_lower_val:.2f}" if bb_lower_val else "--"),
         "macd":        bs("MACD Cross ↓",     1, macd_r,                f"{macd_val:.3f}" if macd_val is not None else "--"),
+        "stochrsi":    bs("StochRSI Cross ↓", 1, stochrsi_bear,         _srsi_val),
         "orb":         bs("ORB Break ↓",      1, orb_dir == 'bear',     f"<{orb_low:.2f}" if orb_low else "No ORB"),
         "gap":         bs("Gap Down",         1, gap_dir == 'bear',     f"{gap_pct:.2f}%" if (gap_pct is not None and gap_pct < 0) else (f"+{gap_pct:.2f}%" if gap_pct is not None else "--")),
         "vix":         bs("Breadth Bear",     1, vix_bear,               vix_label),
@@ -1919,6 +1969,9 @@ def compute_signals(df_1m, df_5m, ticker=None):
         "vpoc": vpoc, "vah": vah, "val": val, "vp_profile": vp_profile,
         "vwap_1u": vwap_1u, "vwap_1d": vwap_1d,
         "vwap_2u": vwap_2u, "vwap_2d": vwap_2d,
+        # Phase 14: Stochastic RSI
+        "stochrsi_k": stochrsi_k,
+        "stochrsi_d": stochrsi_d,
         # Phase 13: confluence quality breakdown
         "bull_breakdown": bull_breakdown,
         "bear_breakdown": bear_breakdown,
@@ -2219,6 +2272,9 @@ async def scan_ticker(client, ticker, market_open):
         "vp_profile": result['vp_profile'],
         "vwap_1u": result['vwap_1u'], "vwap_1d": result['vwap_1d'],
         "vwap_2u": result['vwap_2u'], "vwap_2d": result['vwap_2d'],
+        # Phase 14
+        "stochrsi_k": result.get('stochrsi_k'),
+        "stochrsi_d": result.get('stochrsi_d'),
         # Phase 13
         "bull_breakdown": result.get('bull_breakdown', {}),
         "bear_breakdown": result.get('bear_breakdown', {}),
@@ -2258,10 +2314,11 @@ async def scan_ticker(client, ticker, market_open):
 
     # External alerts
     if market_open and score >= ALERT_SCORE_THRESHOLD:
-        stop = result['bull_stop'] if direction != "BEAR" else result['bear_stop']
-        tp   = result['bull_tp']   if direction != "BEAR" else result['bear_tp']
+        stop   = result['bull_stop'] if direction != "BEAR" else result['bear_stop']
+        tp     = result['bull_tp']   if direction != "BEAR" else result['bear_tp']
+        cq_now = result.get('bull_cq' if direction != 'BEAR' else 'bear_cq', 'WEAK')
         send_notifications(ticker, price, bull_score, bear_score, direction,
-                           vol_spike, result['atr'], stop, tp)
+                           vol_spike, result['atr'], stop, tp, cq=cq_now)
 
     if market_open and vol_spike:
         print(f"⚡ VOLUME SPIKE [{ticker}]: {result['vol_ratio']}x avg", flush=True)
@@ -2796,6 +2853,14 @@ function renderContextRow() {
     html += `<span class="ctx-badge" style="background:#ffaa0015;color:#ffaa00;border:1px solid #ffaa0044" title="First 15 min or last 5 min of RTH — signals may be choppy">⏸ TOD Filter</span>`;
   }
 
+  // Phase 14: StochRSI K/D badge
+  if (d.stochrsi_k != null) {
+    const k = d.stochrsi_k, dv = d.stochrsi_d;
+    const srsiCls = k < 20 ? 'ctx-bull' : k > 80 ? 'ctx-bear' : (k > dv ? 'ctx-bull' : 'ctx-bear');
+    const srsiZone = k < 20 ? ' OS' : k > 80 ? ' OB' : '';
+    html += `<span class="ctx-badge ${srsiCls}" title="Stochastic RSI (K/D lines — 14/14/3/3). OS=Oversold OB=Overbought">StRSI K:${k} D:${dv}${srsiZone}</span>`;
+  }
+
   // PCR chip
   const d2 = allData[curTicker];
   if (d2 && d2.pcr != null) {
@@ -3019,12 +3084,14 @@ function renderAlerts() {
     return;
   }
   panel.innerHTML = d.alerts.map(a => {
-    const clr = a.direction==='BULL' ? '#00ff88' : '#ff6666';
+    const clr    = a.direction==='BULL' ? '#00ff88' : '#ff6666';
+    const cqM    = CQ_META[a.cq] || CQ_META.WEAK;
+    const cqBadge= a.cq ? `<span style="font-size:.55rem;font-weight:bold;color:${cqM.clr};border:1px solid ${cqM.clr}44;padding:0 4px;border-radius:2px;margin-left:4px">${cqM.lbl}</span>` : '';
     return `<div class="alert-item">
       <span style="color:#ffaa00">${a.time}</span>
       <span class="ms-2 fw-bold" style="color:${clr}">${a.direction}</span>
       <span class="ms-2">$${a.price.toFixed(2)}</span>
-      <span class="ms-1 text-muted">· ${a.score}pts</span>
+      <span class="ms-1 text-muted">· ${a.score}pts</span>${cqBadge}
       <div style="color:#777;font-size:.7rem;margin-top:2px">${a.message}</div>
     </div>`;
   }).join('');
