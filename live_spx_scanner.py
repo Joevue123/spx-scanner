@@ -79,6 +79,7 @@ ATR_STOP_MULT         = 1.5      # stop loss = price ± 1.5×ATR
 ATR_TP_MULT           = 2.5      # take profit = price ± 2.5×ATR
 ACCOUNT_SIZE          = float(os.getenv("ACCOUNT_SIZE", "25000"))
 RISK_PCT              = 0.01     # risk 1% of account per trade
+MAX_POSITION_PCT      = 0.20     # max 20% of account notional per trade ($5,000)
 BREADTH_BULL_THRESH   = 3        # tickers in BULL needed for "bull dominant" breadth
 BREADTH_BEAR_THRESH   = 3        # tickers in BEAR needed for "bear dominant" breadth
 PCR_BULL_THRESH       = 0.7      # put/call ratio below this = calls dominating = bullish
@@ -1253,22 +1254,15 @@ def _alpaca_has_conflict(client: TradingClient, ticker: str, direction: str) -> 
 
 
 # ── [3] Dynamic Sizing ───────────────────────────────────────────────────────
-def _calc_order_qty(price: float, score: int) -> float:
-    """
-    Target allocation = TRADE_SIZE_USD × (score / MAX_SCORE)
-
-    Score IS the allocation percentage — pure linear:
-      score=22  → $500 × 0.22 = $110  →  $110 / price
-      score=45  → $500 × 0.45 = $225  →  $225 / price  (e.g. QQQ ~0.30sh)
-      score=70  → $500 × 0.70 = $350  →  $350 / price
-      score=100 → $500 × 1.00 = $500  →  $500 / price
-
-    Returns fractional qty rounded to 2 dp (Alpaca supports fractions for
-    SPY/QQQ/IWM/NVDA/AAPL), minimum 0.01 shares.
-    """
-    target_usd = round(TRADE_SIZE_USD * (score / MAX_SCORE), 2)
-    qty        = max(1, int(target_usd / price))  # whole shares — bracket orders reject fractional
-    return qty
+def _calc_order_qty(price: float, atr: float) -> int:
+    """shares = min(risk-based, notional-cap-based)
+    Risk leg : $250 / (ATR x 1.5) — risks exactly 1% of account
+    Cap leg  : $5,000 / price     — limits notional to 20% of account"""
+    risk_usd     = ACCOUNT_SIZE * RISK_PCT          # $250
+    max_notional = ACCOUNT_SIZE * MAX_POSITION_PCT  # $5,000
+    qty_risk = int(risk_usd     / (atr * ATR_STOP_MULT))
+    qty_cap  = int(max_notional / price)
+    return max(1, min(qty_risk, qty_cap))
 
 
 # ── [4] OCA Bracket Submission ───────────────────────────────────────────────
@@ -1311,9 +1305,9 @@ def submit_alpaca_order(ticker: str, direction: str, price: float,
             stop = round(live_price + ATR_STOP_MULT * atr, 2)
             tp   = round(live_price - ATR_TP_MULT   * atr, 2)
 
-    # [3] Dynamic Sizing  →  target_usd = $500 × (score / 100)
-    qty        = _calc_order_qty(live_price, score)
-    target_usd = round(TRADE_SIZE_USD * (score / MAX_SCORE), 2)
+    # [3] ATR-based sizing  →  risk exactly 1% = $250 per trade
+    qty        = _calc_order_qty(live_price, atr) if atr and atr > 0 else 1
+    dollar_risk = round(qty * (atr or 0) * ATR_STOP_MULT, 2)
     side       = OrderSide.BUY if direction == "BULL" else OrderSide.SELL
 
     # [4] Build OCA bracket and submit
@@ -1336,7 +1330,7 @@ def submit_alpaca_order(ticker: str, direction: str, price: float,
             f"[ALPACA:{env}] BRACKET SUBMITTED\n"
             f"  ID      : {order.id}\n"
             f"  Ticker  : {ticker}  {direction}  qty={qty}sh  "
-            f"(target=${target_usd:.2f} / notional≈${notional:.2f})\n"
+            f"(risk=${dollar_risk:.2f} / notional≈${notional:.2f})\n"
             f"  Entry   : market  |  SL: ${stop:.2f} (-{sl_pct:.2f}%)  "
             f"|  TP: ${tp:.2f} (+{tp_pct:.2f}%)\n"
             f"  Score   : {score}/{MAX_SCORE} ({score/MAX_SCORE*100:.0f}%)  CQ: {cq}",
