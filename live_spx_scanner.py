@@ -26,7 +26,8 @@ from alpaca.data.requests import StockLatestTradeRequest, StockBarsRequest
 from alpaca.data.timeframe import TimeFrame
 from alpaca.data.enums import DataFeed
 from alpaca.trading.requests import (
-    MarketOrderRequest, TakeProfitRequest, StopLossRequest, GetOrdersRequest
+    MarketOrderRequest, TakeProfitRequest, StopLossRequest, GetOrdersRequest,
+    ReplaceOrderRequest
 )
 from alpaca.trading.enums import QueryOrderStatus
 from alpaca.trading.enums import OrderSide, TimeInForce, OrderClass
@@ -85,6 +86,13 @@ ATR_TP_MULT           = 2.5      # take profit = price ± 2.5×ATR
 ACCOUNT_SIZE          = float(os.getenv("ACCOUNT_SIZE", "25000"))
 RISK_PCT              = 0.01     # risk 1% of account per trade
 MAX_POSITION_PCT      = 0.20     # max 20% of account notional per trade ($5,000)
+# Time-of-day trade blocks (ET hour, minute) — avoid noisy windows
+TOD_BLOCK_OPEN        = ((9, 30), (9, 45))   # first 15 min of session
+TOD_BLOCK_LUNCH       = ((12, 0), (13, 0))   # lunch chop
+# Trailing stop thresholds (in R multiples of 1.5×ATR stop)
+TRAIL_BE_R            = 1.0    # move stop to breakeven at +1R
+TRAIL_START_R         = 1.5    # begin trailing at +1.5R
+TRAIL_ATR_MULT        = 0.5    # trail distance = 0.5 × ATR
 BREADTH_BULL_THRESH   = 3        # tickers in BULL needed for "bull dominant" breadth
 BREADTH_BEAR_THRESH   = 3        # tickers in BEAR needed for "bear dominant" breadth
 PCR_BULL_THRESH       = 0.7      # put/call ratio below this = calls dominating = bullish
@@ -965,6 +973,68 @@ def track_signal(ticker, price, stop, tp, direction, score, cq="WEAK"):
     return True
 
 
+
+def _replace_bracket_stop(client, order_id: str, new_stop: float) -> bool:
+    """Find the stop leg of a bracket order and replace its stop price."""
+    try:
+        parent = client.get_order_by_id(order_id)
+        for leg in (parent.legs or []):
+            leg_type = str(getattr(leg, "type", "") or "").lower()
+            if leg_type in ("stop", "stop_limit"):
+                client.replace_order(str(leg.id), ReplaceOrderRequest(stop_price=round(new_stop, 2)))
+                return True
+        print(f"[TRAIL] No stop leg found for order {order_id}", flush=True)
+    except Exception as e:
+        print(f"[TRAIL] Stop replace failed: {e}", flush=True)
+    return False
+
+
+def manage_trailing_stops(client):
+    """Move stops to breakeven at +1R; trail at 0.5 ATR once +1.5R is reached."""
+    if not ALPACA_ENABLED or not client:
+        return
+    for trade_id, t in list(open_trades.items()):
+        if not t.get("alpaca_order_id"):
+            continue
+        ticker    = t["ticker"]
+        direction = t["direction"]
+        entry     = t["entry"]
+        atr       = t.get("atr", 0) or 0
+        if atr <= 0:
+            continue
+        price = (dashboard_data.get(ticker) or {}).get("price") or 0
+        if not price:
+            continue
+        stop_dist = ATR_STOP_MULT * atr                   # 1.5 × ATR = 1R
+        pnl_r = ((price - entry) / stop_dist if direction == "BULL"
+                 else (entry - price) / stop_dist)
+        at_be    = t.get("trail_at_be", False)
+        trailing = t.get("trailing",    False)
+
+        if pnl_r >= TRAIL_START_R:
+            # Trail at TRAIL_ATR_MULT × ATR behind price
+            new_stop = round((price - TRAIL_ATR_MULT * atr) if direction == "BULL"
+                             else (price + TRAIL_ATR_MULT * atr), 2)
+            cur = t.get("trail_stop")
+            better = (cur is None or
+                      (direction == "BULL" and new_stop > cur) or
+                      (direction == "BEAR" and new_stop < cur))
+            if better:
+                if _replace_bracket_stop(client, t["alpaca_order_id"], new_stop):
+                    label = "TRAIL_UPDATE" if trailing else "TRAIL_START"
+                    print(f"[TRAIL] {ticker} {direction} {label} stop=${new_stop:.2f} ({pnl_r:.2f}R)", flush=True)
+                    t["trail_stop"] = new_stop
+                    t["trailing"]   = True
+                    t["trail_at_be"]= True
+
+        elif pnl_r >= TRAIL_BE_R and not at_be and not trailing:
+            # Move stop to breakeven
+            if _replace_bracket_stop(client, t["alpaca_order_id"], round(entry, 2)):
+                print(f"[TRAIL] {ticker} {direction} BREAKEVEN stop=${entry:.2f} ({pnl_r:.2f}R)", flush=True)
+                t["trail_at_be"] = True
+                t["trail_stop"]  = round(entry, 2)
+
+
 def check_outcomes():
     """Check open trades against current prices; close wins/losses/timeouts."""
     global outcomes
@@ -1171,6 +1241,7 @@ def send_notifications(ticker, price, bull_score, bear_score, direction,
                 for t in open_trades.values():
                     if t["ticker"] == ticker and t["direction"] == direction:
                         t["alpaca_order_id"] = alpaca_id
+                        t["atr"]           = atr or 0
                         break
 
     dashboard_data[ticker]["alerts"].insert(0, {
@@ -1279,6 +1350,12 @@ def submit_alpaca_order(ticker: str, direction: str, price: float,
     blocked_cqs = TICKER_CQ_BLOCKLIST.get(ticker, [])
     if cq in blocked_cqs:
         print(f"[ALPACA] {ticker} CQ={cq} blocked by per-ticker filter — skip", flush=True)
+        return None
+    # TOD filter — avoid the open and lunch chop windows
+    _et_now = datetime.now(timezone.utc).astimezone(_ET)
+    _hm     = (_et_now.hour, _et_now.minute)
+    if TOD_BLOCK_OPEN[0] <= _hm < TOD_BLOCK_OPEN[1] or TOD_BLOCK_LUNCH[0] <= _hm < TOD_BLOCK_LUNCH[1]:
+        print(f"[ALPACA] {ticker} blocked by TOD filter ({_et_now.strftime('%H:%M')} ET)", flush=True)
         return None
     """
     Full execution pipeline:  CQ Gate → Conflict Guard → Sizing → OCA Bracket
@@ -3027,6 +3104,7 @@ async def main():
             # Check open simulated trades for TP/SL hits (no extra API calls)
             if market_open:
                 check_outcomes()
+                manage_trailing_stops(_get_alpaca())
 
             # Daily summary: send once after 16:05 ET on trading days
             et_now = datetime.now(timezone.utc).astimezone(_ET)
