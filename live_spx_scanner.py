@@ -55,8 +55,9 @@ HISTORY_FILE_TMPL     = "/tmp/score_history_{}.json"
 MAX_SCORE             = 100      # weighted 0-100 (INST 35 + LEVELS 20 + TECH 30 + PAT 10 + MKT 5)
 ALERT_COOLDOWN_SECS   = 900
 VOLUME_SPIKE_MULT     = 3.0
-ALERT_SCORE_THRESHOLD = 22      # ~22% conviction floor (was 9/42)
-LOG_SCORE_THRESHOLD   = 14      # ~14% log floor (was 6/42)
+ALERT_SCORE_THRESHOLD = 35      # raised: ~35% conviction floor
+LOG_SCORE_THRESHOLD   = 20      # global fallback (per-ticker overrides below)
+TICKER_LOG_SCORE      = {"SPY": 20, "QQQ": 20, "IWM": 14, "AAPL": 14}
 REV_SCORE_THRESHOLD   = 3       # need 3/6 reversal signals to alert
 
 # ── Weighted scoring architecture ─────────────────────────────────────────────
@@ -1824,6 +1825,9 @@ def _weighted_score(signals, regime):
     return round(score)
 
 
+def _log_thresh(ticker: str) -> int:
+    return TICKER_LOG_SCORE.get(ticker, LOG_SCORE_THRESHOLD)
+
 def compute_signals(df_1m, df_5m, ticker=None, pm_high=None, pm_low=None):
     # ── 1m indicators ──────────────────────────────────────────────────────────
     df = df_1m.copy()
@@ -2992,7 +2996,7 @@ async def scan_ticker(client, ticker, market_open):
     cq_now = result.get('bull_cq' if direction != 'BEAR' else 'bear_cq', 'WEAK')
 
     # JSON signal log
-    if score >= LOG_SCORE_THRESHOLD:
+    if score >= _log_thresh(ticker):
         global signal_log
         entry = {
             "time":       datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
@@ -4932,13 +4936,13 @@ def _bt_simulate_ticker(ticker: str, df_full: pd.DataFrame) -> list:
         _is_reversal = _rev_score >= REV_SCORE_THRESHOLD
 
         # Decide direction: higher score wins; skip if both below log threshold
-        if bull_s >= bear_s and bull_s >= LOG_SCORE_THRESHOLD:
+        if bull_s >= bear_s and bull_s >= _log_thresh(ticker):
             direction = "BULL"
             score     = bull_s
             cq        = res.get("bull_cq", "WEAK")
             sl        = res.get("bull_stop")
             tp_price  = res.get("bull_tp")
-        elif bear_s > bull_s and bear_s >= LOG_SCORE_THRESHOLD:
+        elif bear_s > bull_s and bear_s >= _log_thresh(ticker):
             direction = "BEAR"
             score     = bear_s
             cq        = res.get("bear_cq", "WEAK")
