@@ -44,6 +44,10 @@ SMTP_PORT         = int(os.getenv("SMTP_PORT", "587"))
 
 WATCHLIST             = ["SPY", "QQQ", "IWM", "NVDA", "AAPL"]
 AUTO_TRADE_TICKERS    = ["SPY", "QQQ", "IWM", "AAPL"]  # NVDA excluded: no backtest edge
+TICKER_CQ_BLOCKLIST   = {
+    "QQQ": ["MED"],   # MED: PF 0.72, -30.8R over backtest
+    "IWM": ["HIGH"],  # HIGH: PF 0.99, -8.9R; MED/LOW outperform
+}
 SIGNAL_LOG_FILE       = "/tmp/signal_log.json"
 CSV_LOG_FILE          = "/tmp/signals.csv"
 HISTORY_FILE_TMPL     = "/tmp/score_history_{}.json"
@@ -1271,6 +1275,10 @@ def submit_alpaca_order(ticker: str, direction: str, price: float,
                         stop: float, tp: float, score: int, cq: str, atr: float | None = None):
     if ticker not in AUTO_TRADE_TICKERS:
         print(f"[ALPACA] Skipping {ticker} — not in AUTO_TRADE_TICKERS", flush=True)
+        return None
+    blocked_cqs = TICKER_CQ_BLOCKLIST.get(ticker, [])
+    if cq in blocked_cqs:
+        print(f"[ALPACA] {ticker} CQ={cq} blocked by per-ticker filter — skip", flush=True)
         return None
     """
     Full execution pipeline:  CQ Gate → Conflict Guard → Sizing → OCA Bracket
