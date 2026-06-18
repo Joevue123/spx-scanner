@@ -2031,7 +2031,10 @@ def compute_signals(df_1m, df_5m, ticker=None, pm_high=None, pm_low=None):
         bear_stop = round(price + ATR_STOP_MULT * atr_val, 2)
         bear_tp   = round(price - ATR_TP_MULT   * atr_val, 2)
         risk_per_trade = ACCOUNT_SIZE * RISK_PCT
-        pos_size = max(1, int(risk_per_trade / (ATR_STOP_MULT * atr_val)))
+        max_notional   = ACCOUNT_SIZE * MAX_POSITION_PCT
+        qty_risk = int(risk_per_trade / (ATR_STOP_MULT * atr_val))
+        qty_cap  = int(max_notional   / price) if price > 0 else qty_risk
+        pos_size = max(1, min(qty_risk, qty_cap))
 
     # ── ORB direction (needs price) ───────────────────────────────────────────
     if orb_high is not None and orb_low is not None:
