@@ -144,7 +144,7 @@ SIGNAL_CATEGORIES = {
     "session_range":"LEVELS",
     "sma200":       "TECH",
     # INST — institutional and smart-money flow
-    "block_print":"INST","flow_unusual":"INST","vol_delta":"INST",
+    "block_print":"INST","flow_unusual":"INST","vol_delta":"INST","vol_delta_div":"INST",
     "vwap_def":"INST",  "tape_read":"INST",  "obv":"INST",
     # MARKET — macro context, regime, and breadth
     "vix":"MARKET",    "pcr":"MARKET",   "trend_15m":"MARKET",
@@ -2082,8 +2082,8 @@ def compute_signals(df_1m, df_5m, ticker=None, pm_high=None, pm_low=None):
     vol_delta_raw, vol_delta_div, bull_pct = compute_volume_delta(df_1m)
     # Directional: positive delta = buyers in control (bull signal)
     #              negative delta = sellers in control (bear signal)
-    delta_bull = vol_delta_raw is not None and vol_delta_raw > 0
-    delta_bear = vol_delta_raw is not None and vol_delta_raw < 0
+    delta_bull = bull_pct is not None and bull_pct > 60
+    delta_bear = bull_pct is not None and bull_pct < 40
     delta_label = (f"{bull_pct}% buy pressure" if bull_pct is not None else "No data")
 
     # 4. VWAP defense / bounce zone
@@ -2268,7 +2268,8 @@ def compute_signals(df_1m, df_5m, ticker=None, pm_high=None, pm_low=None):
         # ── Institutional flow ─────────────────────────────────────────────────
         "block_print": bs("Dark Pool Accum",  1, block_dir == 'bull',    f"×{block_mult}" if block_mult else "No print"),
         "flow_unusual":bs("Unusual Calls",    1, unusual_calls,           flow_label),
-        "vol_delta":   bs("Vol Delta ▲",      1, delta_bull,              delta_label),
+        "vol_delta":     bs("Vol Delta ▲",     1, delta_bull,              delta_label),
+        "vol_delta_div": bs("Delta Absorb ▲",  1, vol_delta_div == 'bull', "Buyers absorbing selloff" if vol_delta_div == 'bull' else delta_label),
         "vwap_def":    bs("VWAP Bounce",      1, vwap_event == 'bounce',  vwap_def_label),
         "tape_read":   bs("Tape Aggression ↑",1, tape_bull,               tape_label),
         "obv":         bs("OBV Trend ↑",      1, obv_bull_ok,             obv_trend or "--"),
@@ -2340,7 +2341,8 @@ def compute_signals(df_1m, df_5m, ticker=None, pm_high=None, pm_low=None):
         # ── Institutional flow ─────────────────────────────────────────────────
         "block_print": bs("Dark Pool Dist",   1, block_dir == 'bear',    f"×{block_mult}" if block_mult else "No print"),
         "flow_unusual":bs("Unusual Puts",     1, unusual_puts,            flow_label),
-        "vol_delta":   bs("Vol Delta ▼",      1, delta_bear,              delta_label),
+        "vol_delta":     bs("Vol Delta ▼",     1, delta_bear,              delta_label),
+        "vol_delta_div": bs("Delta Dist ▼",    1, vol_delta_div == 'bear', "Sellers distributing rally" if vol_delta_div == 'bear' else delta_label),
         "vwap_def":    bs("VWAP Rejection",   1, vwap_event == 'rejection',vwap_def_label),
         "tape_read":   bs("Tape Aggression ↓",1, tape_bear,               tape_label),
         "obv":         bs("OBV Trend ↓",      1, obv_bear_ok,             obv_trend or "--"),
