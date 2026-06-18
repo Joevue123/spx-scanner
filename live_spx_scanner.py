@@ -43,6 +43,7 @@ SMTP_HOST         = os.getenv("SMTP_HOST", "smtp.gmail.com")
 SMTP_PORT         = int(os.getenv("SMTP_PORT", "587"))
 
 WATCHLIST             = ["SPY", "QQQ", "IWM", "NVDA", "AAPL"]
+AUTO_TRADE_TICKERS    = ["SPY", "QQQ", "IWM", "AAPL"]  # NVDA excluded: no backtest edge
 SIGNAL_LOG_FILE       = "/tmp/signal_log.json"
 CSV_LOG_FILE          = "/tmp/signals.csv"
 HISTORY_FILE_TMPL     = "/tmp/score_history_{}.json"
@@ -1268,6 +1269,9 @@ def _calc_order_qty(price: float, atr: float) -> int:
 # ── [4] OCA Bracket Submission ───────────────────────────────────────────────
 def submit_alpaca_order(ticker: str, direction: str, price: float,
                         stop: float, tp: float, score: int, cq: str, atr: float | None = None):
+    if ticker not in AUTO_TRADE_TICKERS:
+        print(f"[ALPACA] Skipping {ticker} — not in AUTO_TRADE_TICKERS", flush=True)
+        return None
     """
     Full execution pipeline:  CQ Gate → Conflict Guard → Sizing → OCA Bracket
 
