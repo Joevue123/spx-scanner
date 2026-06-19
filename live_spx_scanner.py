@@ -1608,7 +1608,7 @@ def health():
         "status":      "healthy",
         "market_open": is_market_open(),
         "watchlist":   WATCHLIST,
-        "time":        datetime.now().strftime("%H:%M:%S"),
+        "time":        datetime.now(timezone.utc).astimezone(_ET).strftime("%H:%M:%S"),
     })
 
 
@@ -2730,7 +2730,7 @@ def fetch_options_flow(ticker_sym):
             "top_call_strikes":  top_call_strikes,
             "top_put_strikes":   top_put_strikes,
             "expiry":       exps[0],
-            "last_update":  datetime.now().strftime("%H:%M:%S"),
+            "last_update":  datetime.now(timezone.utc).astimezone(_ET).strftime("%H:%M:%S"),
         }
         # Update dashboard_data so it's visible immediately
         if ticker_sym in dashboard_data:
@@ -2778,7 +2778,7 @@ def update_market_breadth():
         "bull_count":  bull_count,
         "bear_count":  bear_count,
         "breadth":     breadth,
-        "last_update": datetime.now().strftime("%H:%M:%S"),
+        "last_update": datetime.now(timezone.utc).astimezone(_ET).strftime("%H:%M:%S"),
     })
     print(f"Breadth: {bull_count}B/{bear_count}b/{total} → {breadth}", flush=True)
 
@@ -2893,7 +2893,7 @@ async def scan_ticker(client, ticker, market_open):
         "bear_score":   bear_score,
         "direction":    direction,
         "status":       status,
-        "last_update":  datetime.now().strftime("%H:%M:%S"),
+        "last_update":  datetime.now(timezone.utc).astimezone(_ET).strftime("%H:%M:%S"),
         "market_open":  market_open,
         "volume_spike": vol_spike,
         "vol_ratio":    result['vol_ratio'],
@@ -2999,7 +2999,7 @@ async def scan_ticker(client, ticker, market_open):
     if score >= _log_thresh(ticker):
         global signal_log
         entry = {
-            "time":       datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "time":       datetime.now(timezone.utc).astimezone(_ET).strftime("%Y-%m-%d %H:%M:%S"),
             "ticker":     ticker,
             "price":      price,
             "bull_score": bull_score,
