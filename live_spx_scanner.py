@@ -56,6 +56,8 @@ MAX_SCORE             = 100      # weighted 0-100 (INST 35 + LEVELS 20 + TECH 30
 ALERT_COOLDOWN_SECS   = 900
 VOLUME_SPIKE_MULT     = 3.0
 ALERT_SCORE_THRESHOLD = 35      # raised: ~35% conviction floor
+CONFIRM_SCANS         = 2       # require N consecutive above-threshold scans before alert
+MAX_DAILY_TRADES      = 4       # max Alpaca orders per ticker per day
 LOG_SCORE_THRESHOLD   = 20      # global fallback (per-ticker overrides below)
 TICKER_LOG_SCORE      = {"SPY": 20, "QQQ": 20, "IWM": 14, "AAPL": 14}
 REV_SCORE_THRESHOLD   = 3       # need 3/6 reversal signals to alert
@@ -1385,6 +1387,16 @@ def submit_alpaca_order(ticker: str, direction: str, price: float,
     if _alpaca_has_conflict(client, ticker, direction):
         return None
 
+    # [2b] Daily trade cap per ticker
+    global _daily_trade_counts
+    _today_et = datetime.now(timezone.utc).astimezone(_ET).strftime("%Y-%m-%d")
+    _dtc = _daily_trade_counts.get(ticker, {"date": "", "count": 0})
+    if _dtc["date"] != _today_et:
+        _dtc = {"date": _today_et, "count": 0}
+    if _dtc["count"] >= MAX_DAILY_TRADES:
+        print(f"[ALPACA] {ticker} daily cap reached ({_dtc['count']}/{MAX_DAILY_TRADES}) — skip", flush=True)
+        return None
+
     # [3] Anchor to live Alpaca price to avoid stale-data SL/TP rejection
     live_price = _get_live_price(ticker, price)
     if atr and atr > 0:
@@ -1412,6 +1424,8 @@ def submit_alpaca_order(ticker: str, direction: str, price: float,
             stop_loss=StopLossRequest(    stop_price=round(stop, 2)),
         )
         order    = client.submit_order(req)
+        _dtc["count"] += 1
+        _daily_trade_counts[ticker] = _dtc
         notional = round(qty * live_price, 2)
         env      = "PAPER" if ALPACA_PAPER else "LIVE"
         sl_pct   = abs(price - stop) / price * 100
@@ -1525,6 +1539,8 @@ _blank_ticker = lambda t: {
 
 dashboard_data = {t: _blank_ticker(t) for t in WATCHLIST}
 signal_log     = load_signal_log()
+_signal_confirm    = {}   # {ticker: {"direction": str, "score": int, "count": int}}
+_daily_trade_counts = {}  # {ticker: {"date": str, "count": int}}
 
 # Economic calendar events for the current week
 econ_events  = []
@@ -3021,7 +3037,15 @@ async def scan_ticker(client, ticker, market_open):
     # External alerts — only fire when score is at/above threshold AND rising (not falling through)
     velocity_now = bull_velocity if direction != 'BEAR' else bear_velocity
     rising = velocity_now is None or velocity_now >= 0
-    if market_open and score >= ALERT_SCORE_THRESHOLD and rising:
+    # Consecutive confirmation: same direction must score >= threshold on CONFIRM_SCANS consecutive scans
+    global _signal_confirm
+    _prev_sig   = _signal_confirm.get(ticker, {})
+    _same_dir   = _prev_sig.get("direction") == direction
+    _prev_ok    = _prev_sig.get("score", 0) >= ALERT_SCORE_THRESHOLD
+    _conf_count = (_prev_sig.get("count", 0) + 1) if (_same_dir and _prev_ok) else 1
+    _signal_confirm[ticker] = {"direction": direction, "score": score, "count": _conf_count}
+    _confirmed  = _conf_count >= CONFIRM_SCANS
+    if market_open and score >= ALERT_SCORE_THRESHOLD and rising and _confirmed:
         stop = result['bull_stop'] if direction != "BEAR" else result['bear_stop']
         tp   = result['bull_tp']   if direction != "BEAR" else result['bear_tp']
         send_notifications(ticker, price, bull_score, bear_score, direction,
